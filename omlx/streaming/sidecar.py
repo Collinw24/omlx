@@ -47,20 +47,48 @@ _F_NOCACHE: int = 48
 _PROJECTION_ORDER = ("gate_proj", "up_proj", "down_proj")
 _CATEGORY_ORDER = ("weight", "scales", "biases")
 
-# Regex components for expert tensor key detection.
-# Examples:
-#   language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight
-#   language_model.mtp.layers.0.mlp.switch_mlp.up_proj.scales
-#   mtp.layers.0.mlp.switch_mlp.down_proj.biases
-_EXPERT_KEY_RE_STR = (
-    r".*\.layers\.(\d+)\.mlp\.switch_mlp\."
-    r"(gate|up|down)_proj\.(weight|scales|biases)$"
-)
+# ── Multi-architecture key detection registry ───────────────────────────
+# Each entry: (regex_str, layer_group, proj_group, cat_group, expert_group_or_None, model_type_tag)
+# - layer_group: 1-based regex group index for the layer number.
+# - proj_group: 1-based group index for the projection name (gate/up/down).
+# - cat_group: 1-based group index for the category (weight/scales/biases).
+#   Use 0 if the pattern has no separate category (e.g. Mixtral w1/w2/w3,
+#   where the matched token is the full weight — category is synthesised
+#   as "weight").
+# - expert_group_or_None: None if expert index is a tensor dimension (Qwen-style
+#   3D tensors where shape[0] == num_experts); an int group index if the expert
+#   index appears directly in the safetensors key (Mixtral/DeepSeek per-expert keys).
+# - model_type_tag: human-readable architecture tag stored in the sidecar header.
+_EXPERT_KEY_PARSERS: list[tuple[str, int, int, int, int | None, str]] = [
+    # Qwen3.5-MoE / Qwen2-MoE: switch_mlp layout.
+    # Keys: language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight
+    # Expert index is shape[0] of the 3D tensor, NOT in the key.
+    # Groups: 1=layer, 2=proj(gate/up/down), 3=cat(weight/scales/biases)
+    (
+        r".*\.layers\.(\d+)\.mlp\.switch_mlp\.(gate|up|down)_proj\.(weight|scales|biases)$",
+        1, 2, 3, None, "qwen_moe",
+    ),
+    # Mixtral / Mistral-MoE: block_sparse_moe.experts.{idx}
+    # Keys: model.layers.0.block_sparse_moe.experts.0.w1
+    # Expert index IS in the key (group 2).  w1/w2/w3 are full weights with
+    # no separate scales/biases — cat is synthesised as "weight" (cat_group=0).
+    # Groups: 1=layer, 2=expert, 3=proj(w1/w2/w3)
+    (
+        r".*\.layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.(w1|w2|w3)$",
+        1, 3, 0, 2, "mixtral",
+    ),
+    # DeepSeek-V2/V3/V4 MoE: mlp.experts.{idx}
+    # Keys: model.layers.0.mlp.experts.0.gate_proj.weight
+    # Expert index IS in the key (group 2).
+    # Groups: 1=layer, 2=expert, 3=proj, 4=cat
+    (
+        r".*\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$",
+        1, 3, 4, 2, "deepseek_moe",
+    ),
+]
 
-# Key prefixes for tensor discovery – any key containing one of these
-# substrings AND ending in .weight/.scales/.biases is considered an expert
-# tensor candidate.
-_EXPERT_MARKERS = (".switch_mlp.",)
+# Map projection short names (w1/w2/w3 from Mixtral) to canonical names.
+_MIXTRAL_PROJ_MAP: dict[str, str] = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
 
 
 def _get_dtype_bytes(dtype: str) -> int:
@@ -94,24 +122,51 @@ def _parse_safetensors_header(filepath: Path) -> tuple[int, dict[str, Any]]:
     return data_offset, header
 
 
-def _parse_expert_key(key: str) -> tuple[int, str, str] | None:
+def _parse_expert_key(key: str) -> tuple[int, int | None, str, str, str] | None:
     """Try to parse a safetensors key as an expert projection tensor.
 
+    Iterates the multi-architecture ``_EXPERT_KEY_PARSERS`` registry.
+    Supports Qwen (switch_mlp), Mixtral (block_sparse_moe), and DeepSeek
+    (mlp.experts) key layouts.
+
     Returns:
-        ``(layer_idx, projection, category)`` or ``None`` if the key does
-        not match the expected expert tensor pattern.
+        ``(layer_idx, expert_idx_or_None, projection, category, model_type_tag)``
+        or ``None`` if the key does not match any known MoE layout.
+
+        ``expert_idx_or_None`` is ``None`` for Qwen-style (expert index is a
+        tensor dimension) and an ``int`` for Mixtral/DeepSeek-style (expert
+        index appears in the safetensors key).
     """
-    m = re.match(_EXPERT_KEY_RE_STR, key)
-    if m is None:
-        return None
-    return int(m.group(1)), m.group(2) + "_proj", m.group(3)
+    for regex_str, layer_g, proj_g, cat_g, expert_g, tag in _EXPERT_KEY_PARSERS:
+        m = re.match(regex_str, key)
+        if m is None:
+            continue
+        layer_idx = int(m.group(layer_g))
+        proj_raw = m.group(proj_g)
+        expert_idx = int(m.group(expert_g)) if expert_g is not None else None
+
+        # Resolve category: if cat_g is 0 (Mixtral), synthesize "weight"
+        # since w1/w2/w3 are full weight tensors with no separate
+        # scales/biases in the key.
+        if cat_g == 0:
+            cat_raw = "weight"
+        else:
+            cat_raw = m.group(cat_g)
+
+        # Normalize projection names to canonical form.
+        if proj_raw in _MIXTRAL_PROJ_MAP:
+            proj_raw = _MIXTRAL_PROJ_MAP[proj_raw]
+        elif not proj_raw.endswith("_proj"):
+            proj_raw = proj_raw + "_proj"
+
+        return layer_idx, expert_idx, proj_raw, cat_raw, tag
+
+    return None
 
 
 def _is_expert_key(key: str) -> bool:
-    """Return True if *key* looks like an expert projection tensor."""
-    if not any(marker in key for marker in _EXPERT_MARKERS):
-        return False
-    return key.endswith((".weight", ".scales", ".biases"))
+    """Return True if *key* matches any known MoE expert tensor pattern."""
+    return _parse_expert_key(key) is not None
 
 
 def _layer_key(key: str, layer_idx: int) -> str:
@@ -134,41 +189,55 @@ def _layer_key(key: str, layer_idx: int) -> str:
 # (filepath, data_section_offset, start_offset, end_offset, shape, dtype)
 _TensorRecord = tuple[Path, int, int, int, tuple[int, ...], str]
 
+# Composite key: (layer_idx, proj, cat, expert_idx_or_None).
+# expert_idx_or_None is None for Qwen-style (dimension-based experts) and an
+# int for Mixtral/DeepSeek-style (key-based experts).
+_ExpertKey = tuple[int, str, str, int | None]
+
 
 def _discover_expert_tensors(
     model_path: Path,
-) -> dict[str, dict[tuple[int, str, str], _TensorRecord]]:
+) -> tuple[
+    dict[str, dict[_ExpertKey, _TensorRecord]],
+    str,  # detected model_type tag
+]:
     """Scan all safetensors files and index every expert projection tensor.
 
-    Returns a dict keyed by the safetensors file path (as string), mapping to a
-    dict of ``(layer_idx, projection, category) -> tensor_record`` for tensors
-    contained in that file.
+    Detects the model architecture from the first matched parser in
+    ``_EXPERT_KEY_PARSERS``.
+
+    Returns:
+        ``(per_file_index, detected_model_type)`` where *per_file_index* maps
+        safetensors file path → dict of ``(layer_idx, proj, cat, expert_or_None)``
+        → tensor record.
     """
     st_files = sorted(model_path.glob("*.safetensors"))
     if not st_files:
         raise FileNotFoundError(f"No .safetensors files found in {model_path}")
 
-    result: dict[str, dict[tuple[int, str, str], _TensorRecord]] = {}
+    result: dict[str, dict[_ExpertKey, _TensorRecord]] = {}
+    detected_model_type: str | None = None
 
     for sf_path in st_files:
         data_offset, header = _parse_safetensors_header(sf_path)
-        file_tensors: dict[tuple[int, str, str], _TensorRecord] = {}
+        file_tensors: dict[_ExpertKey, _TensorRecord] = {}
 
         for key, meta in header.items():
             if key == "__metadata__":
-                continue
-            if not _is_expert_key(key):
                 continue
             parsed = _parse_expert_key(key)
             if parsed is None:
                 continue
 
-            layer_idx, projection, category = parsed
+            layer_idx, expert_idx, projection, category, tag = parsed
+            if detected_model_type is None:
+                detected_model_type = tag
+
             shape = tuple(meta["shape"])
             dtype = meta["dtype"]
             start_off, end_off = meta["data_offsets"]
 
-            file_tensors[(layer_idx, projection, category)] = (
+            file_tensors[(layer_idx, projection, category, expert_idx)] = (
                 sf_path,
                 data_offset,
                 start_off,
@@ -186,25 +255,39 @@ def _discover_expert_tensors(
     if not result:
         raise ValueError(
             f"No expert projection tensors found in {model_path}. "
-            f"Expected keys containing 'switch_mlp'."
+            f"Expected MoE keys matching switch_mlp, block_sparse_moe.experts, "
+            f"or mlp.experts patterns (Qwen/Mixtral/DeepSeek layouts)."
         )
 
-    return result
+    return result, detected_model_type or "unknown_moe"
 
 
 # ---------------------------------------------------------------------------
-# Sidecar writing
+# Sidecar writing helpers
 # ---------------------------------------------------------------------------
 
 
 def _build_layer_metadata(
-    file_index: dict[tuple[int, str, str], _TensorRecord],
+    file_index: dict[_ExpertKey, _TensorRecord],
     layer_idx: int,
+    is_dimension_based: bool,
 ) -> dict[str, Any]:
     """Build the per-layer metadata entry for the sidecar JSON header.
 
     Reads shapes and dtypes from the tensor records. Computes per-expert
-    byte lengths for each projection/category.
+    byte lengths for each projection/category.  Handles both Qwen-style
+    (3D tensors, expert is a dimension) and Mixtral/DeepSeek-style (2D
+    tensors, expert is in the key).
+
+    Parameters
+    ----------
+    file_index:
+        Combined expert tensor index keyed by (layer, proj, cat, expert_or_None).
+    layer_idx:
+        Numeric layer index to build metadata for.
+    is_dimension_based:
+        True for Qwen-style (shape[0] == num_experts), False for key-based
+        architectures (tensor shape is already per-expert 2D).
     """
     import numpy as np
 
@@ -216,7 +299,19 @@ def _build_layer_metadata(
         proj_total = 0
 
         for cat in _CATEGORY_ORDER:
-            key = (layer_idx, proj, cat)
+            # For dimension-based (Qwen), look up with expert=None.
+            # For key-based, any expert works; use 0 as reference.
+            lookup_expert: int | None = None if is_dimension_based else 0
+            key = (layer_idx, proj, cat, lookup_expert)
+
+            # For key-based archs the expert may be numbered differently;
+            # try the first available if lookup_expert=0 isn't found.
+            if key not in file_index and not is_dimension_based:
+                for (li, p, c, ei), _ in file_index.items():
+                    if li == layer_idx and p == proj and c == cat:
+                        key = (li, p, c, ei)
+                        break
+
             if key not in file_index:
                 # Missing category (e.g. no biases in unquantized models).
                 proj_meta[f"{cat}_shape"] = []
@@ -226,8 +321,15 @@ def _build_layer_metadata(
 
             _, _, _, _, shape, dtype = file_index[key]
             bpe = _DTYPE_BYTES.get(dtype, 1)
-            # Per-expert shape: drop the first (expert) dimension.
-            per_expert_shape = tuple(int(s) for s in shape[1:])
+
+            # Per-expert shape: for dimension-based, drop the first (expert)
+            # dimension from the 3D tensor.  For key-based, the tensor is
+            # already 2D per-expert.
+            if is_dimension_based:
+                per_expert_shape = tuple(int(s) for s in shape[1:])
+            else:
+                per_expert_shape = tuple(int(s) for s in shape)
+
             per_expert_bytes = int(np.prod(per_expert_shape) * bpe)
 
             proj_meta[f"{cat}_shape"] = list(per_expert_shape)
@@ -247,11 +349,31 @@ def _read_tensor_slice(
     start_offset: int,
     expert_idx: int,
     per_expert_bytes: int,
-    dtype: str,
 ) -> bytes:
     """Read the raw bytes for one expert from a safetensors file descriptor."""
     offset = data_section_offset + start_offset + expert_idx * per_expert_bytes
     return os.pread(fd, per_expert_bytes, offset)
+
+
+def _compute_per_expert_bytes(
+    shape: tuple[int, ...],
+    dtype: str,
+    *,
+    is_dimension_based: bool = True,
+) -> int:
+    """Compute the number of bytes for a single expert's slice of a tensor.
+
+    For dimension-based layouts (Qwen), drops ``shape[0]`` (the expert dim).
+    For key-based layouts (Mixtral/DeepSeek), the shape is already per-expert.
+    """
+    import numpy as np
+
+    bpe = _DTYPE_BYTES.get(dtype, 1)
+    if is_dimension_based:
+        per_expert_shape = shape[1:]
+    else:
+        per_expert_shape = shape
+    return int(np.prod(per_expert_shape) * bpe)
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +399,9 @@ class StreamingExpertSidecar:
     ----------
     header : dict
         The parsed JSON header containing layer/projection metadata.
+    nocache_active : bool
+        True if ``F_NOCACHE`` Direct I/O is active on the underlying file
+        descriptor (read-only).
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -291,9 +416,11 @@ class StreamingExpertSidecar:
         # buffers, never polluting the UBC.
         try:
             fcntl.fcntl(self._fd, fcntl.F_NOCACHE, 1)
+            self._nocache_active = True
         except OSError:
             # F_NOCACHE may not be supported on all volumes / macOS versions.
             # Fall back to buffered I/O — still correct, just not UBC-safe.
+            self._nocache_active = False
             logger.debug("F_NOCACHE not available; using buffered I/O.")
 
         try:
@@ -322,12 +449,25 @@ class StreamingExpertSidecar:
             os.close(self._fd)
             raise
 
+        nocache_str = "active" if self._nocache_active else "fallback (buffered)"
         logger.debug(
-            "Opened sidecar %s (F_NOCACHE): %d layers, %d experts tracked.",
+            "Opened sidecar %s (F_NOCACHE %s): %d layers, %d experts tracked.",
             self._path.name,
+            nocache_str,
             len(self.header.get("layers", {})),
             len(self._offsets),
         )
+
+    @property
+    def nocache_active(self) -> bool:
+        """True if ``F_NOCACHE`` Direct I/O is active on this sidecar.
+
+        When True, ``os.pread()`` calls bypass the macOS Unified Buffer Cache,
+        streaming data directly from NVMe SSD into user-space buffers without
+        polluting the UBC.  Essential for 100+ GB MoE models where UBC
+        pressure would otherwise cause memory compression and swap thrashing.
+        """
+        return self._nocache_active
 
     def _resolve_offset_len(self, layer: int | str, expert: int) -> tuple[int, int]:
         """Resolve (layer, expert) to (byte_offset, byte_length) in sidecar."""
@@ -349,21 +489,149 @@ class StreamingExpertSidecar:
         return self._offsets[key], self._lengths[key]
 
     def read_expert(self, layer: int | str, expert: int) -> bytes:
-        """Read the full expert chunk via direct ``os.pread()``.
+        """Read the full expert chunk and return it as a new ``bytes`` object.
+
+        This allocates a Python bytes object and is intended for tooling,
+        validation, and debugging — not the hot inference path.  For the
+        zero-copy hot path use :meth:`read_expert_into` with a pre-allocated
+        Metal-compatible buffer.
 
         Data flows directly from NVMe SSD into the returned buffer (when
-        ``F_NOCACHE`` is active), bypassing the Unified Buffer Cache.  The
-        caller owns the returned bytes and is responsible for constructing
-        ``mx.array`` objects or copying them into pre-allocated GPU slot
-        bank buffers.
-
-        Returns the raw bytes containing weight, scales, and biases for all
-        projections (gate_proj, up_proj, down_proj) packed contiguously.
-        Use ``self.header['layers'][str(layer)]['projections']`` to split
-        the byte range into individual arrays.
+        ``F_NOCACHE`` is active), bypassing the Unified Buffer Cache.
         """
         offset, length = self._resolve_offset_len(layer, expert)
         return os.pread(self._fd, length, offset)
+
+    def read_expert_into(
+        self,
+        layer: int | str,
+        expert: int,
+        buf: memoryview,
+        buf_offset: int = 0,
+    ) -> int:
+        """Read expert bytes directly into a pre-allocated buffer.
+
+        Zero-copy path for the hot inference loop.  Uses ``os.preadv()``
+        (Python 3.12+) for scatter-gather I/O into the memoryview without
+        a Python ``bytes`` intermediate.  Falls back to ``os.pread()`` +
+        slice assignment on older Python.
+
+        The buffer must be backed by a page-aligned allocation (16 KiB on
+        Apple Silicon) if the result will be wrapped into a Metal buffer
+        via ``newBufferWithBytesNoCopy``.
+
+        Parameters
+        ----------
+        layer:
+            Layer identifier. Integer for backbone layers, string like
+            ``"mtp_0"`` for MTP layers.
+        expert:
+            Expert index within the layer.
+        buf:
+            Pre-allocated writable buffer supporting the buffer protocol
+            (e.g. ``memoryview`` of a ``bytearray`` or an ``mx.array``
+            memoryview obtained via ``ctypes``).
+        buf_offset:
+            Byte offset within *buf* to begin writing at.
+
+        Returns
+        -------
+        int
+            Number of bytes read (always equals the expert length from the
+            sidecar header on success).
+        """
+        offset, length = self._resolve_offset_len(layer, expert)
+
+        if hasattr(os, "preadv"):
+            # Python 3.12+: single syscall, no intermediate bytes allocation.
+            # preadv reads directly into a slice of the pre-allocated buffer.
+            target = buf[buf_offset : buf_offset + length]
+            nread = os.preadv(self._fd, [target], offset)
+        else:
+            # Fallback: pread into a temporary bytes object, then copy into
+            # the pre-allocated buffer.
+            raw = os.pread(self._fd, length, offset)
+            nread = len(raw)
+            buf[buf_offset : buf_offset + nread] = raw
+
+        if nread != length:
+            raise RuntimeError(
+                f"Short read on sidecar {self._path.name}: "
+                f"layer={layer} expert={expert}: "
+                f"expected {length} bytes, got {nread}"
+            )
+        return nread
+
+    def verify(self, sample_layers: int = 3) -> bool:
+        """Validate sidecar integrity by spot-checking experts from random layers.
+
+        Reads expert 0 and the last expert from *sample_layers* randomly
+        selected layers.  Confirms each read returns exactly the expected
+        length from the header.  This is a quick integrity check — it does
+        not verify byte-content correctness (that requires a model output
+        comparison).
+
+        Parameters
+        ----------
+        sample_layers:
+            Maximum number of layers to spot-check (default 3).
+
+        Returns
+        -------
+        bool
+            ``True`` if all spot-checks pass, ``False`` if any read returned
+            an unexpected length.
+        """
+        import random
+
+        layers = list({lk for (lk, _) in self._offsets})
+        if not layers:
+            logger.warning("Sidecar has no layer entries to verify.")
+            return True
+
+        sample_count = min(sample_layers, len(layers))
+        chosen = random.sample(layers, sample_count)
+
+        checks_passed = 0
+        for lk in chosen:
+            # Find max expert index for this layer.
+            experts_in_layer = sorted(ei for (ll, ei) in self._offsets if ll == lk)
+            if not experts_in_layer:
+                logger.warning("Layer %r has no expert entries; skipping.", lk)
+                continue
+
+            for test_expert in (experts_in_layer[0], experts_in_layer[-1]):
+                expected_len = self._lengths.get((lk, test_expert))
+                if expected_len is None:
+                    logger.warning(
+                        "Layer %r expert %d: missing length in lookup table.",
+                        lk, test_expert,
+                    )
+                    return False
+
+                try:
+                    raw = self.read_expert(lk, test_expert)
+                except OSError as exc:
+                    logger.warning(
+                        "Verification I/O error: layer %r expert %d: %s",
+                        lk, test_expert, exc,
+                    )
+                    return False
+
+                if len(raw) != expected_len:
+                    logger.warning(
+                        "Verification mismatch: layer %r expert %d: "
+                        "expected %d bytes, got %d bytes.",
+                        lk, test_expert, expected_len, len(raw),
+                    )
+                    return False
+                checks_passed += 1
+
+        logger.info(
+            "Sidecar verification passed: %d spot-checks across %d layers OK.",
+            checks_passed, sample_count,
+        )
+        return True
 
     def close(self) -> None:
         """Close the underlying file descriptor."""
@@ -400,6 +668,10 @@ class StreamingExpertSidecar:
         Apple Silicon's virtual memory page size for zero-copy Metal buffer
         wrapping).
 
+        Supports Qwen (switch_mlp), Mixtral (block_sparse_moe), and DeepSeek
+        (mlp.experts) MoE key layouts.  The detected architecture is stored as
+        ``model_type`` in the sidecar header.
+
         Parameters
         ----------
         model_path:
@@ -408,7 +680,7 @@ class StreamingExpertSidecar:
             Destination path for the generated sidecar file.
         alignment:
             Byte alignment for expert chunks (default 16384 for Apple Silicon
-            16KiB page alignment).
+            16 KiB page alignment).
 
         Returns
         -------
@@ -423,32 +695,34 @@ class StreamingExpertSidecar:
         )
 
         # ── Phase 1: Discover expert tensors ────────────────────────────
-        per_file = _discover_expert_tensors(model_path)
+        per_file, detected_model_type = _discover_expert_tensors(model_path)
+        logger.info("Detected MoE architecture: %s", detected_model_type)
 
-        # Flatten into a combined index keyed by (layer_idx, proj, cat).
-        # Also record the original safetensors key so we can reconstruct
-        # layer_key strings ("0" vs "mtp_0").
-        combined: dict[tuple[int, str, str], _TensorRecord] = {}
+        # Determine whether this is dimension-based (Qwen: expert in shape[0])
+        # or key-based (Mixtral/DeepSeek: expert in safetensors key).
+        is_dimension_based = detected_model_type in ("qwen_moe",)
+
+        # Flatten into a combined index.
+        combined: dict[_ExpertKey, _TensorRecord] = {}
         layer_key_map: dict[int, str] = {}
 
         for sf_path_str, file_tensors in per_file.items():
-            for (layer_idx, proj, cat), rec in file_tensors.items():
-                if (layer_idx, proj, cat) in combined:
+            for (layer_idx, proj, cat, expert_idx), rec in file_tensors.items():
+                key = (layer_idx, proj, cat, expert_idx)
+                if key in combined:
                     logger.warning(
-                        "Duplicate tensor key layer=%d proj=%s cat=%s; using last.",
-                        layer_idx, proj, cat,
+                        "Duplicate tensor key layer=%d proj=%s cat=%s expert=%s; using last.",
+                        layer_idx, proj, cat, expert_idx,
                     )
-                combined[(layer_idx, proj, cat)] = rec
+                combined[key] = rec
 
-        # Determine layer keys and num_experts by re-scanning headers
-        # to find the original safetensors keys.
+        # Determine layer keys by re-scanning headers to find original
+        # safetensors keys for mtp vs backbone detection.
         for sf_path_str in per_file:
             sf_path = Path(sf_path_str)
             _, header = _parse_safetensors_header(sf_path)
             for key in header:
                 if key == "__metadata__":
-                    continue
-                if not _is_expert_key(key):
                     continue
                 parsed = _parse_expert_key(key)
                 if parsed is None:
@@ -461,65 +735,91 @@ class StreamingExpertSidecar:
         if not sorted_layers:
             raise ValueError("No expert layers discovered.")
 
-        # Determine num_experts and hidden_size from the first layer.
+        # Determine num_experts per layer.
         first_layer = sorted_layers[0]
         num_experts: dict[int, int] = {}
-        for li in sorted_layers:
-            for (li2, proj, cat), rec in combined.items():
-                if li2 == li and cat == "weight":
-                    num_experts[li] = rec[4][0]
-                    break
-            if li not in num_experts:
-                num_experts[li] = 0
+        if is_dimension_based:
+            # Qwen-style: num_experts = shape[0] of any weight tensor.
+            for li in sorted_layers:
+                for (li2, proj, cat, ei), rec in combined.items():
+                    if li2 == li and cat == "weight" and ei is None:
+                        num_experts[li] = rec[4][0]
+                        break
+                if li not in num_experts:
+                    num_experts[li] = 0
+        else:
+            # Key-based: count distinct expert indices.
+            for li in sorted_layers:
+                experts_in_layer: set[int] = set()
+                for (li2, _, _, ei), _ in combined.items():
+                    if li2 == li and ei is not None:
+                        experts_in_layer.add(ei)
+                num_experts[li] = len(experts_in_layer)
 
-        sample_key = (first_layer, "gate_proj", "weight")
-        if sample_key not in combined:
-            for proj in _PROJECTION_ORDER:
-                sample_key = (first_layer, proj, "weight")
-                if sample_key in combined:
+        # Determine hidden_size from the first layer's first available tensor.
+        hidden_size = 0
+        for li in sorted_layers:
+            for (li2, proj, cat, ei), rec in combined.items():
+                if li2 == li and cat == "weight":
+                    if is_dimension_based:
+                        hidden_size = int(min(rec[4][1], rec[4][2]))
+                    else:
+                        hidden_size = int(min(rec[4][0], rec[4][1]))
                     break
-        sample_shape = combined[sample_key][4]
-        hidden_size = int(min(sample_shape[1], sample_shape[2]))
+            if hidden_size > 0:
+                break
 
         # ── Phase 2: Build per-layer metadata ───────────────────────────
         layers_header: dict[str, Any] = {}
-        # Expert entries: list of (layer_key, expert_idx, offset, length, chunk_bytes)
-        expert_layout: list[tuple[str, int, int, int, bytes]] = []
 
         for layer_idx in sorted_layers:
             lk = layer_key_map[layer_idx]
-            meta = _build_layer_metadata(combined, layer_idx)
+            meta = _build_layer_metadata(combined, layer_idx, is_dimension_based)
             layers_header[lk] = {
                 "projections": meta["projections"],
                 "experts": {},  # filled in after offset computation
             }
 
-        # ── Phase 3: Compute expert chunk layout ────────────────────────
-        # First compute the JSON header size to know where data starts.
-        # We'll build the header dict incrementally, serialize it, then
-        # compute exact offsets.
-        header_dict: dict[str, Any] = {
+        # ── Phase 3: Bounded single-pass header offset computation ─────
+        # Build a placeholder header with MAX_LEN values to determine the
+        # true upper bound for the JSON header size.  This avoids the
+        # two-pass delta-shift retry that could theoretically loop.
+        placeholder_experts = {"0": {"offset": 9999999999, "length": 9999999}}
+        placeholder_layers = {
+            lk: {
+                "projections": layers_header[lk]["projections"],
+                "experts": placeholder_experts,
+            }
+            for lk in (layer_key_map[li] for li in sorted_layers)
+        }
+        placeholder_header: dict[str, Any] = {
             "version": 1,
-            "model_type": "qwen3_5_moe",
+            "model_type": detected_model_type,
             "num_layers": len(sorted_layers),
             "num_experts": num_experts.get(first_layer, 0),
             "hidden_size": hidden_size,
             "alignment": alignment,
-            "layers": {lk: {"projections": layers_header[lk]["projections"], "experts": {}}
-                       for lk in (layer_key_map[li] for li in sorted_layers)},
+            "layers": placeholder_layers,
         }
+        placeholder_json = json.dumps(placeholder_header, separators=(",", ":"))
+        # A 4-byte-lengths header grows by at most a few bytes per expert
+        # entry when switching from "9999999999" to real offsets.  64 bytes
+        # of slack against a 16 KiB alignment is always sufficient.
+        header_upper_bound = len(placeholder_json) + 64
+        first_data_offset = _align_up(4 + header_upper_bound, alignment)
 
-        header_json = json.dumps(header_dict, separators=(",", ":"))
-        # Data starts at the first alignment boundary after 4 + len(header_json).
-        first_data_offset = _align_up(4 + len(header_json), alignment)
-
-        # Pre-compute all expert chunks (extract bytes from safetensors).
-        logger.info("Extracting expert weights from %d safetensors files ...", len(per_file))
+        # ── Phase 4: Extract expert bytes from safetensors ──────────────
+        logger.info(
+            "Extracting expert weights from %d safetensors files ...", len(per_file)
+        )
 
         # Open all safetensors file descriptors for pread.
         st_fds: dict[str, int] = {}
         for sf_path_str in per_file:
             st_fds[sf_path_str] = os.open(sf_path_str, os.O_RDONLY)
+
+        # (layer_key, expert_idx, offset, length, chunk_bytes)
+        expert_layout: list[tuple[str, int, int, int, bytes]] = []
 
         try:
             current_offset = first_data_offset
@@ -530,67 +830,77 @@ class StreamingExpertSidecar:
                 n_exp = num_experts[layer_idx]
                 lk_progress = 0
 
-                for expert_idx in range(n_exp):
-                    chunk_parts: list[bytes] = []
-                    total_bytes = 0
-
-                    for proj in _PROJECTION_ORDER:
-                        for cat in _CATEGORY_ORDER:
-                            key = (layer_idx, proj, cat)
-                            if key not in combined:
-                                continue
-                            sf_path, data_off, start_off, end_off, shape, dtype = combined[key]
-                            per_expert_bytes = _compute_per_expert_bytes(shape, dtype)
-
-                            sf_fd = st_fds[str(sf_path)]
-                            raw = _read_tensor_slice(
-                                sf_fd, data_off, start_off, expert_idx,
-                                per_expert_bytes, dtype,
-                            )
-                            chunk_parts.append(raw)
-                            total_bytes += len(raw)
-
-                    # Pad to alignment boundary.
-                    padded_len = _align_up(total_bytes, alignment)
-                    padding = b"\x00" * (padded_len - total_bytes)
-                    chunk = b"".join(chunk_parts) + padding
-                    expert_layout.append((lk, expert_idx, current_offset, total_bytes, chunk))
-                    current_offset += padded_len
-                    total_experts += 1
-                    lk_progress += 1
+                if is_dimension_based:
+                    # Qwen: iterate expert indices 0..n_exp-1, slice from 3D tensors.
+                    for expert_idx in range(n_exp):
+                        chunk, total_bytes = _build_expert_chunk_dimension_based(
+                            st_fds, combined, layer_idx, expert_idx, alignment,
+                        )
+                        expert_layout.append(
+                            (lk, expert_idx, current_offset, total_bytes, chunk)
+                        )
+                        padded_len = _align_up(total_bytes, alignment)
+                        current_offset += padded_len
+                        total_experts += 1
+                        lk_progress += 1
+                else:
+                    # Mixtral/DeepSeek: enumerate distinct expert indices from keys.
+                    layer_experts = sorted(
+                        ei for (li, _, _, ei), _ in combined.items()
+                        if li == layer_idx and ei is not None
+                    )
+                    # Deduplicate.
+                    layer_experts = sorted(set(layer_experts))
+                    for expert_idx in layer_experts:
+                        chunk, total_bytes = _build_expert_chunk_key_based(
+                            st_fds, combined, layer_idx, expert_idx, alignment,
+                        )
+                        expert_layout.append(
+                            (lk, expert_idx, current_offset, total_bytes, chunk)
+                        )
+                        padded_len = _align_up(total_bytes, alignment)
+                        current_offset += padded_len
+                        total_experts += 1
+                        lk_progress += 1
 
                 logger.debug(
-                    "Layer %s (%s): %d experts extracted.",
-                    lk, layer_key_map[layer_idx], lk_progress,
+                    "Layer %s: %d experts extracted.",
+                    lk, lk_progress,
                 )
 
-            # ── Phase 4: Finalize header with expert offsets ────────────
+            # ── Phase 5: Finalize header with real expert offsets ───────
+            header_dict: dict[str, Any] = {
+                "version": 1,
+                "model_type": detected_model_type,
+                "num_layers": len(sorted_layers),
+                "num_experts": num_experts.get(first_layer, 0),
+                "hidden_size": hidden_size,
+                "alignment": alignment,
+                "layers": {
+                    lk: {
+                        "projections": layers_header[lk]["projections"],
+                        "experts": {},
+                    }
+                    for lk in (layer_key_map[li] for li in sorted_layers)
+                },
+            }
             for lk, ei, offset, length, _chunk in expert_layout:
                 header_dict["layers"][lk]["experts"][str(ei)] = {
                     "offset": offset,
                     "length": length,
                 }
 
-            # Re-serialize header with final offsets.
+            # Serialize once — the upper-bound slack guarantees no overflow.
             header_json = json.dumps(header_dict, separators=(",", ":"))
             header_bytes = header_json.encode("utf-8")
             header_len_prefix = struct.pack("<I", len(header_bytes))
+            actual_first = _align_up(4 + len(header_bytes), alignment)
+            assert actual_first <= first_data_offset, (
+                f"Header upper-bound slack insufficient: "
+                f"actual={actual_first} > planned={first_data_offset}"
+            )
 
-            # Verify first data offset is still valid.
-            computed_first = _align_up(4 + len(header_bytes), alignment)
-            if computed_first > first_data_offset:
-                # JSON header grew due to expert entries – offsets shifted.
-                # Recompute all offsets.
-                delta = computed_first - first_data_offset
-                for lk in header_dict["layers"]:
-                    for ek in header_dict["layers"][lk]["experts"]:
-                        header_dict["layers"][lk]["experts"][ek]["offset"] += delta
-                header_json = json.dumps(header_dict, separators=(",", ":"))
-                header_bytes = header_json.encode("utf-8")
-                header_len_prefix = struct.pack("<I", len(header_bytes))
-                first_data_offset = computed_first
-
-            # ── Phase 5: Write the sidecar file ─────────────────────────
+            # ── Phase 6: Write the sidecar file ─────────────────────────
             logger.info(
                 "Writing sidecar with %d experts (%d layers) to %s ...",
                 total_experts, len(sorted_layers), output_path,
@@ -599,13 +909,13 @@ class StreamingExpertSidecar:
             with open(output_path, "wb") as out:
                 out.write(header_len_prefix)
                 out.write(header_bytes)
-                # Pad to first data offset.
+                # Pad to planned first data offset.
                 header_end = 4 + len(header_bytes)
                 pad_needed = first_data_offset - header_end
                 if pad_needed > 0:
                     out.write(b"\x00" * pad_needed)
                 # Write expert chunks.
-                for lk, ei, offset, length, chunk in expert_layout:
+                for _lk, _ei, _offset, _length, chunk in expert_layout:
                     out.write(chunk)
 
             file_size = output_path.stat().st_size
@@ -618,43 +928,80 @@ class StreamingExpertSidecar:
             for fd in st_fds.values():
                 os.close(fd)
 
-        # ── Phase 6: Validate and return ────────────────────────────────
+        # ── Phase 7: Validate and return ────────────────────────────────
         sidecar = StreamingExpertSidecar(output_path)
-
-        # Spot-check: read a random expert from each layer.
-        logger.info("Validating sidecar ...")
-        for layer_idx in sorted_layers:
-            lk = layer_key_map[layer_idx]
-            n_exp = num_experts[layer_idx]
-            if n_exp == 0:
-                continue
-            # Read expert 0 and the last expert.
-            for test_expert in (0, n_exp - 1):
-                try:
-                    raw = sidecar.read_expert(lk, test_expert)
-                    expected_len = header_dict["layers"][lk]["experts"][str(test_expert)]["length"]
-                    if len(raw) != expected_len:
-                        raise RuntimeError(
-                            f"Validation failed: layer {lk} expert {test_expert}: "
-                            f"expected {expected_len} bytes, got {len(raw)}"
-                        )
-                except Exception as exc:
-                    sidecar.close()
-                    raise RuntimeError(
-                        f"Sidecar validation failed for layer {lk} expert {test_expert}: {exc}"
-                    ) from exc
-
-        logger.info("Sidecar validation passed.")
+        if not sidecar.verify(sample_layers=3):
+            sidecar.close()
+            raise RuntimeError(
+                f"Sidecar verification failed for {output_path}. "
+                f"The file may be corrupt or truncated."
+            )
         return sidecar
 
 
-def _compute_per_expert_bytes(shape: tuple[int, ...], dtype: str) -> int:
-    """Compute the number of bytes for a single expert's slice of a tensor."""
-    import numpy as np
+def _build_expert_chunk_dimension_based(
+    st_fds: dict[str, int],
+    combined: dict[_ExpertKey, _TensorRecord],
+    layer_idx: int,
+    expert_idx: int,
+    alignment: int,
+) -> tuple[bytes, int]:
+    """Build a single expert chunk for Qwen-style (dimension-based) layouts.
 
-    bpe = _DTYPE_BYTES.get(dtype, 1)
-    per_expert_shape = shape[1:]  # drop the expert dimension
-    return int(np.prod(per_expert_shape) * bpe)
+    Expert index comes from the tensor dimension (shape[0]).
+    """
+    chunk_parts: list[bytes] = []
+    total_bytes = 0
+
+    for proj in _PROJECTION_ORDER:
+        for cat in _CATEGORY_ORDER:
+            key = (layer_idx, proj, cat, None)
+            if key not in combined:
+                continue
+            sf_path, data_off, start_off, _end_off, shape, dtype = combined[key]
+            per_expert_bytes = _compute_per_expert_bytes(shape, dtype, is_dimension_based=True)
+
+            sf_fd = st_fds[str(sf_path)]
+            raw = _read_tensor_slice(sf_fd, data_off, start_off, expert_idx, per_expert_bytes)
+            chunk_parts.append(raw)
+            total_bytes += len(raw)
+
+    padded_len = _align_up(total_bytes, alignment)
+    padding = b"\x00" * (padded_len - total_bytes)
+    return b"".join(chunk_parts) + padding, total_bytes
+
+
+def _build_expert_chunk_key_based(
+    st_fds: dict[str, int],
+    combined: dict[_ExpertKey, _TensorRecord],
+    layer_idx: int,
+    expert_idx: int,
+    alignment: int,
+) -> tuple[bytes, int]:
+    """Build a single expert chunk for Mixtral/DeepSeek (key-based) layouts.
+
+    Expert index comes from the safetensors key, not a tensor dimension.
+    """
+    chunk_parts: list[bytes] = []
+    total_bytes = 0
+
+    for proj in _PROJECTION_ORDER:
+        for cat in _CATEGORY_ORDER:
+            key = (layer_idx, proj, cat, expert_idx)
+            if key not in combined:
+                continue
+            sf_path, data_off, start_off, _end_off, shape, dtype = combined[key]
+            per_expert_bytes = _compute_per_expert_bytes(shape, dtype, is_dimension_based=False)
+
+            sf_fd = st_fds[str(sf_path)]
+            # For key-based, the entire tensor is a single expert — no slicing.
+            raw = os.pread(sf_fd, per_expert_bytes, data_off + start_off)
+            chunk_parts.append(raw)
+            total_bytes += len(raw)
+
+    padded_len = _align_up(total_bytes, alignment)
+    padding = b"\x00" * (padded_len - total_bytes)
+    return b"".join(chunk_parts) + padding, total_bytes
 
 
 # ---------------------------------------------------------------------------
