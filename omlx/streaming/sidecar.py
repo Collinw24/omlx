@@ -2,17 +2,19 @@
 """StreamingExpertSidecar: SSD-backed expert weight streaming for MoE models.
 
 Stores expert weights from safetensors in a single flat binary file with
-4KB-aligned contiguous expert chunks. Enables single ``os.pread()`` per expert
-during inference, allowing large MoE models to run on machines with limited
-unified memory.
+16KB-aligned contiguous expert chunks (matching Apple Silicon's virtual memory
+page size for zero-copy Metal buffer wrapping).  Uses Direct I/O
+(``F_NOCACHE``) to bypass the macOS Unified Buffer Cache, preventing UBC
+bloat and memory compression under sustained streaming of 100+ GB models.
+
+Enables single ``os.pread()`` per expert during inference.
 """
 
 from __future__ import annotations
 
-import ctypes
+import fcntl
 import json
 import logging
-import mmap as _mmap
 import os
 import re
 import struct
@@ -30,27 +32,16 @@ _DTYPE_BYTES: dict[str, int] = {
     "F8_E4M3": 1, "F8_E5M2": 1, "F8_E8M0": 1,
 }
 
-# Default alignment for expert chunks (4KB sector boundary).
-_DEFAULT_ALIGNMENT = 4096
+# Default alignment for expert chunks.
+# Apple Silicon uses a 16 KiB virtual memory page size.  Any pointer wrapped
+# into a Metal buffer (newBufferWithBytesNoCopy / mx.array) must be aligned
+# to a 16 KiB boundary, otherwise the UMA subsystem rejects it or forces a
+# blocking CPU-side copy.
+_DEFAULT_ALIGNMENT = 16384  # 16 KiB
 
-# madvise(2) constants for UBC control on macOS / BSD.
-# From <sys/mman.h>: MADV_WILLNEED = 3, MADV_DONTNEED = 4.
-_MADV_WILLNEED: int = 3
-_MADV_DONTNEED: int = 4
-
-# Cache the madvise libc function pointer (lazy-init).
-_madvise_fn: Any | None = None
-
-
-def _get_madvise():
-    """Return the libc madvise(addr, length, advice) function."""
-    global _madvise_fn
-    if _madvise_fn is None:
-        libc = ctypes.CDLL("libc.dylib", use_errno=True)
-        _madvise_fn = libc.madvise
-        _madvise_fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-        _madvise_fn.restype = ctypes.c_int
-    return _madvise_fn
+# macOS F_NOCACHE constant — bypasses the Unified Buffer Cache for direct
+# NVMe → GPU buffer I/O.  Defined in <sys/fcntl.h>.
+_F_NOCACHE: int = 48
 
 # Projection order within each expert chunk.
 _PROJECTION_ORDER = ("gate_proj", "up_proj", "down_proj")
@@ -80,7 +71,7 @@ def _get_dtype_bytes(dtype: str) -> int:
 
 
 def _align_up(offset: int, alignment: int = _DEFAULT_ALIGNMENT) -> int:
-    """Round *offset* up to the next multiple of *alignment*."""
+    """Round *offset* up to the next multiple of *alignment* (default 16 KiB)."""
     return ((offset + alignment - 1) // alignment) * alignment
 
 
@@ -269,11 +260,13 @@ def _read_tensor_slice(
 
 
 class StreamingExpertSidecar:
-    """Read-only access to a streaming expert sidecar file.
+    """Read-only access to a streaming expert sidecar file via Direct I/O.
 
-    Provides single ``os.pread()`` access to 4KB-aligned expert chunks
+    Provides single ``os.pread()`` access to 16KiB-aligned expert chunks
     containing all projection weights (gate, up, down) for a single expert
-    in a single contiguous byte range.
+    in a single contiguous byte range.  The file descriptor is opened with
+    ``F_NOCACHE`` to bypass the macOS Unified Buffer Cache, preventing UBC
+    bloat during sustained streaming of 100+ GB models.
 
     Parameters
     ----------
@@ -286,14 +279,22 @@ class StreamingExpertSidecar:
         The parsed JSON header containing layer/projection metadata.
     """
 
-    def __init__(self, path: str | Path, *, use_mmap: bool = True) -> None:
+    def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
         if not self._path.exists():
             raise FileNotFoundError(f"Sidecar file not found: {self._path}")
 
-        self._fd = os.open(str(self._path), os.O_RDWR if use_mmap else os.O_RDONLY)
-        self._mm: _mmap.mmap | None = None
-        self._mm_ptr: int = 0
+        self._fd = os.open(str(self._path), os.O_RDONLY)
+
+        # Enable Direct I/O: bypass the Unified Buffer Cache so that data
+        # flows directly from NVMe into the process's pre-allocated GPU
+        # buffers, never polluting the UBC.
+        try:
+            fcntl.fcntl(self._fd, fcntl.F_NOCACHE, 1)
+        except OSError:
+            # F_NOCACHE may not be supported on all volumes / macOS versions.
+            # Fall back to buffered I/O — still correct, just not UBC-safe.
+            logger.debug("F_NOCACHE not available; using buffered I/O.")
 
         try:
             # Read header length (4 bytes, little-endian uint32).
@@ -317,23 +318,13 @@ class StreamingExpertSidecar:
                     expert_idx = int(expert_key)
                     self._offsets[(layer_key, expert_idx)] = expert_data["offset"]
                     self._lengths[(layer_key, expert_idx)] = expert_data["length"]
-
-            # mmap the entire file for zero-copy access + madvise control.
-            if use_mmap:
-                file_size = self._path.stat().st_size
-                self._mm = _mmap.mmap(self._fd, file_size, prot=_mmap.PROT_READ | _mmap.PROT_WRITE)
-                # Get the raw pointer to the mmap'd region for madvise.
-                self._mm_ptr = ctypes.addressof(
-                    (ctypes.c_ubyte * file_size).from_buffer(self._mm)
-                )
         except Exception:
-            self.close()
+            os.close(self._fd)
             raise
 
         logger.debug(
-            "Opened sidecar %s (mmap=%s): %d layers, %d experts tracked.",
+            "Opened sidecar %s (F_NOCACHE): %d layers, %d experts tracked.",
             self._path.name,
-            self._mm is not None,
             len(self.header.get("layers", {})),
             len(self._offsets),
         )
@@ -357,73 +348,25 @@ class StreamingExpertSidecar:
             )
         return self._offsets[key], self._lengths[key]
 
-    def get_ptr(self, layer: int | str, expert: int) -> int:
-        """Return the absolute memory address of an expert's data in the mmap.
-
-        Requires ``use_mmap=True`` at init. Raises ``RuntimeError`` if the
-        sidecar was opened without mmap.
-        """
-        if self._mm is None:
-            raise RuntimeError(
-                "get_ptr requires mmap mode (use_mmap=True at init)."
-            )
-        offset, _length = self._resolve_offset_len(layer, expert)
-        return self._mm_ptr + offset
-
-    def madvise_willneed(self, layer: int | str, expert: int) -> int:
-        """Tell the kernel to prefetch an expert's pages into the UBC.
-
-        Calls ``madvise(MADV_WILLNEED)`` on the mmap'd region for the given
-        expert.  The kernel begins reading pages from NVMe asynchronously;
-        no Python I/O is performed.  Returns 0 on success, -1 on error.
-
-        Requires ``use_mmap=True`` at init.
-        """
-        if self._mm is None:
-            return -1
-        offset, length = self._resolve_offset_len(layer, expert)
-        fn = _get_madvise()
-        return fn(self._mm_ptr + offset, length, _MADV_WILLNEED)
-
-    def madvise_dontneed(self, layer: int | str, expert: int) -> int:
-        """Immediately free an expert's physical pages from the UBC.
-
-        Calls ``madvise(MADV_DONTNEED)`` on the mmap'd region.  Because the
-        file mapping is read-only and backed by SSD, the kernel can drop the
-        pages instantly without write-back.  Returns 0 on success, -1 on error.
-
-        Requires ``use_mmap=True`` at init.
-        """
-        if self._mm is None:
-            return -1
-        offset, length = self._resolve_offset_len(layer, expert)
-        fn = _get_madvise()
-        return fn(self._mm_ptr + offset, length, _MADV_DONTNEED)
-
     def read_expert(self, layer: int | str, expert: int) -> bytes:
-        """Read the full expert chunk via ``os.pread()``.
+        """Read the full expert chunk via direct ``os.pread()``.
+
+        Data flows directly from NVMe SSD into the returned buffer (when
+        ``F_NOCACHE`` is active), bypassing the Unified Buffer Cache.  The
+        caller owns the returned bytes and is responsible for constructing
+        ``mx.array`` objects or copying them into pre-allocated GPU slot
+        bank buffers.
 
         Returns the raw bytes containing weight, scales, and biases for all
         projections (gate_proj, up_proj, down_proj) packed contiguously.
         Use ``self.header['layers'][str(layer)]['projections']`` to split
         the byte range into individual arrays.
-
-        This uses OS pread for reliability. For zero-copy access from the
-        mmap region, use :meth:`get_ptr`.
         """
         offset, length = self._resolve_offset_len(layer, expert)
         return os.pread(self._fd, length, offset)
 
     def close(self) -> None:
-        """Close the underlying file descriptor and mmap."""
-        if self._mm is not None:
-            try:
-                self._mm.close()
-            except Exception:
-                pass
-            self._mm = None
-            self._mm_ptr = 0
-
+        """Close the underlying file descriptor."""
         if self._fd >= 0:
             os.close(self._fd)
             self._fd = -1
@@ -451,7 +394,11 @@ class StreamingExpertSidecar:
         alignment: int = _DEFAULT_ALIGNMENT,
     ) -> "StreamingExpertSidecar":
         """Scan safetensors in *model_path*, extract expert weights, and write
-        a contiguous 4KB-aligned sidecar file to *output_path*.
+        a contiguous sidecar file to *output_path*.
+
+        Expert chunks are padded to *alignment* bytes (default 16 KiB to match
+        Apple Silicon's virtual memory page size for zero-copy Metal buffer
+        wrapping).
 
         Parameters
         ----------
@@ -460,8 +407,8 @@ class StreamingExpertSidecar:
         output_path:
             Destination path for the generated sidecar file.
         alignment:
-            Byte alignment for expert chunks (default 4096 for NVMe sector
-            alignment / ``F_NOCACHE`` compatibility).
+            Byte alignment for expert chunks (default 16384 for Apple Silicon
+            16KiB page alignment).
 
         Returns
         -------
