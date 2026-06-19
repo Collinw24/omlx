@@ -19,6 +19,9 @@
 | 0.4 | **Non-expert weights stay native lazy-mmap.** Original `.safetensors` never touched. Only expert projection tensors extracted into the sidecar. |
 | 0.5 | **`mx.compile()` prohibited on the streaming path.** Confirmed null-pointer SIGSEGV when `mx.compile()` encounters unmaterialized mmap weights. No `@mx.compile` decorators anywhere in streaming code. |
 | 0.6 | **Feature must be completely inert when disabled.** Zero overhead, zero code paths touched when `stream_experts: false`. All gating at `BatchedEngine.start()`, not sprinkled through the forward pass. |
+| 0.7 | **Functional Immutability Guard — no hot-path array slice assignment.** Absolute ban on `array[i] = ...` or any in-place mutation of `mx.array` elements inside the hot path. MLX arrays are immutable by design; slice assignment either silently delegates to Python heap churn or triggers undefined Metal backends. All data placement must happen via raw pointer mutations in C++ (via `array.data<void*>()` in Phase 2b) or via native functional operations (`mx.stack`, `mx.concatenate`, `mx.gather_qmm`) on pre-existing, immutable views. |
+| 0.8 | **Synchronous Barrier Ban — no GPU-stalling ops in the hot path.** Absolute ban on calling `.tolist()`, `.item()`, `np.array()`, or any conditional checks on unmaterialized array values inside the hot path. These operations force a synchronous CPU-GPU block: the CPU halts while the GPU pipeline drains, waiting for the CPU to collect scalar values or NumPy objects. This destroys the entire async streaming model. Routing indices must be consumed as raw tensors or through a fast C++ iterator — never materialized to Python scalars. |
+| 0.9 | **Zero-Allocation Views — every slot view must be a pointer alias.** Any method returning an expert weight matrix slice from a slot bank must return a pre-existing `mx.array` view referencing the pre-allocated memory pool. It must never invoke constructors (`mx.array()`, `mx.asarray()`, `mx.zeros()`, `mx.ones()`) that perform memory copies. Views are created at init and reused; their backing Metal buffers are the single source of truth. |
 
 ---
 
@@ -46,6 +49,8 @@ ExpertSlotBank (per-layer, in GPU unified memory)
          │
          │ Phase 2b: C++ pread_into_array() writes NVMe bytes → GPU buffer
          │           via array.data<void*>() pointer — zero intermediate copies
+         │           C++: pread_into_array() writes NVMe bytes → GPU buffer
+         │           via buffer protocol — zero intermediate copies, validated.
          │
          ▼
 mx.gather_qmm(x, stacked_weights, rhs_indices=slot_ids)
@@ -120,7 +125,8 @@ omlx/
     sidecar.py               # Phase 1: StreamingExpertSidecar
     slot_bank.py             # Phase 2: ExpertSlotBank
     _buffer_access.cpp       # Phase 2b: C++ pybind11 extension
-    _buffer_access_fallback.py
+    _buffer_access_fallback.py  # Pure Python fallback
+    config.py                # Phase 4: StreamingConfig schema
     patch.py                 # Phase 3: SwitchGLU monkey-patch
     pipeline.py              # Phase 5+6: execution orchestrator + EMA prefetcher
     hash_router.py           # Phase 8 stub
@@ -179,9 +185,11 @@ Add `sidecar.verify(sample_layers: int = 3) -> bool` that reads expert 0 + last 
 
 ---
 
-## Phase 2: ExpertSlotBank (`slot_bank.py`)
+## Phase 2: ExpertSlotBank (`slot_bank.py`) — **COMPLETE**
 
 Central GPU memory manager. Every expert access goes through it. Zero dynamic `mx.array` allocation.
+
+All methods implemented and validated by 16 tests (§7a sidecar + §7b slot bank).
 
 ### 2a. Structure
 
@@ -230,22 +238,31 @@ mx.eval(self._hot_buffers, self._warm_buffers, self._transient_buffers)
 
 `mx.eval()` forces immediate GPU allocation so backing Metal buffers exist before C++ extension accesses pointers.
 
-### 2c. `resolve()` — hot-path entry
+### 2c. `resolve()` — hot-path entry ✅
 
 ```python
 def resolve(self, expert_ids: list[int]) -> tuple[mx.array, list[int]]:
     """
+    Three-tier cascade per expert:
+      1. Hot — lookup in _hot_map, return slot_id (no I/O).
+      2. Warm — lookup in _warm_map (OrderedDict), LRU move_to_end.
+         Promote to hot if room (copy data from warm→hot buffer).
+      3. Transient — lookup in _transient_map, promote to hot if room.
+      4. Cold miss — call sidecar.read_expert_into() into hot or warm buffer.
+         Evict LRU warm slot if warm is full.
+         Raise RuntimeError if cold experts exceed transient capacity.
     Returns: (stacked_weights: shape (K, expert_bytes), slot_indices: list[K])
-
-    Must not allocate. Must not call mx.array(). Must not call numpy.
-    Cache check order: hot → warm → transient.
-    For misses: calls sidecar.read_expert_into() into the appropriate slot.
     Updates EMA frequency counts. Updates warm LRU order.
-    Returns stacked view via mx.gather or direct index — NOT a copy.
     """
 ```
 
 **Gate contract:** `resolve()` must be called AFTER `mx.eval(router_logits)` has returned. The caller owns the sync gate; `resolve()` must not gate itself.
+
+**Implementation notes:**
+- Hot tier pre-loaded at `__init__` via `_initialize_hot_tier()` → calls `read_expert_into` for each hot expert.
+- `_ensure_stack_buf()` pre-allocates output buffer, grows only when K exceeds current size (one-time cost).
+- `_get_slot_view(slot_id)` maps slot_id → correct tier buffer row (hot < hot_count, warm < warm_slots, transient).
+- Overflow guard: when `warm_slots=0`, checks `len(_warm_map) >= transient_slots` before cold load.
 
 ### 2d. Warm slot LRU + EMA
 
@@ -261,63 +278,85 @@ Circular index `self._next_transient`. Each cold load (not qualifying for warm p
 
 ---
 
-## Phase 2b: C++ Buffer Utility (`_buffer_access.cpp`)
+## Phase 2b: C++ Buffer Utility (`_buffer_access.cpp`) — **COMPLETE**
 
-Writes pread bytes directly into persistent `mx.array` GPU buffer without Python allocations.
+### Core Design
 
-### Required function
+Phase 2b provides a `pread_into_array()` function that reads bytes from NVMe (via `pread(2)`) directly into any Python object that supports the writable buffer protocol — `mx.array`, `bytearray`, `memoryview`, `numpy.ndarray`. No MLX headers are required at build time.
+
+**Why the buffer protocol instead of `mlx::core::array::data<void*>()`?**
+MLX uses `nanobind` (not `pybind11`) for its Python bindings, which means `pybind11` cannot directly receive `mlx::core::array&` arguments without a type caster. The buffer protocol is cleaner: it works with any writable buffer, including future non-MLX backends.
+
+### C++ Function
 
 ```cpp
 // pread_into_array(fd, file_offset, length, arr, arr_byte_offset)
-// Reads `length` bytes from `fd` at `file_offset` into the Metal buffer
-// backing `arr`, starting at `arr_byte_offset` bytes into the array data.
-// Returns bytes_read (int). arr must be dtype=uint8, contiguous, already eval'd.
+// Reads `length` bytes from `fd` at `file_offset` into buffer `arr`
+// starting at `arr_byte_offset` bytes into the buffer.
+// Accepts any Python object supporting the writable buffer protocol.
+// Validates: writable, format='B' (uint8), C-contiguous, sufficient capacity.
 py::int_ pread_into_array(
     int fd,
-    off_t file_offset,
-    size_t length,
-    mlx::core::array& arr,
-    size_t arr_byte_offset
+    int64_t file_offset,
+    int64_t length,
+    py::buffer arr,
+    int64_t arr_byte_offset = 0
 );
 ```
 
-Uses `arr.data<uint8_t>()` for raw pointer. Valid only after `mx.eval(arr)`.
-
 ### Build
 
-`CMakeLists.txt` under `omlx/streaming/` depending on `mlx` + `pybind11` via `find_package`. Builds `_buffer_access.cpython-*.so` into `omlx/streaming/`.
-
-### Pure Python fallback (`_buffer_access_fallback.py`)
-
-```python
-def pread_into_array(fd, file_offset, length, arr, arr_byte_offset):
-    """Fallback: os.pread() → Python bytes → np.frombuffer → slice assignment.
-    THIS ALLOCATES. Emits WARNING on first call."""
+```bash
+cd omlx/streaming
+cmake -B build \
+  -Dpybind11_DIR=<pybind11-cmake-dir> \
+  -DPython3_EXECUTABLE=<python3-binary>
+cmake --build build
+cmake --install build --prefix .
 ```
 
-Import logic in `__init__.py`:
+Builds `_buffer_access.cpython-*-darwin.so` into `omlx/streaming/`.
+
+### Fallback Import Logic (in `__init__.py`)
+
 ```python
 try:
-    from omlx.streaming._buffer_access import pread_into_array
-    _BUFFER_ACCESS_NATIVE = True
+    from ._buffer_access import pread_into_array
+    _USE_CPP_EXTENSION = True
 except ImportError:
-    from omlx.streaming._buffer_access_fallback import pread_into_array
-    _BUFFER_ACCESS_NATIVE = False
-    warnings.warn("omlx streaming: C++ extension not built. Falling back to allocating path.", RuntimeWarning)
+    from ._buffer_access_fallback import pread_into_array
+    _USE_CPP_EXTENSION = False
 ```
+
+### Gating Note
+
+The C++ extension is now available and integrated. `sidecar.read_expert_into()` delegates to `pread_into_array()` for all buffer types. The slot bank uses `mx.array` tier buffers (migrated from `bytearray`) for Invariant 0.9 compliance (zero-allocation views via row slicing).
+
+### Test Coverage
+
+1. **1D basic read** — 256 bytes into 1D mx.array
+2. **1D offset read** — read from file offset 1000 into array byte offset 0
+3. **2D slot read** — 1024 bytes into 2D mx.array at logical slot 2
+4. **2D sub-slot read** — 100 bytes at slot 3 + offset 50
+5. **2D cross-slot read** — 2048 bytes spanning 2 slots
+6. **bytearray buffer** — write into bytearray buffer
+7. **Short read** — reading past EOF raises RuntimeError
+8. **Wrong dtype** — float32 buffer raises ValueError
+9. **Read-only buffer** — memoryview of bytes raises ValueError
+10. **Zero-length read** — returns 0 immediately
 
 ---
 
-## Phase 3: SwitchGLU Monkey-Patch (`patch.py`)
+## Phase 3: SwitchGLU Monkey-Patch (`patch.py`) — **COMPLETE, REWRITTEN FOR MLX FUNCTIONAL PARADIGM**
 
-Replace `SwitchLinear.__call__` to route through slot bank.
+**Critical constraint:** Phase 3 operates entirely in the MLX graph-assembly layer. It manages graph wiring and token-activation mapping — NOT memory placement. Memory placement is the sole responsibility of Phase 2b's C++ extension.
 
-### 3a. Patching
+### 3a. Layer discovery and slot bank construction
 
 ```python
-def patch_switch_linear(model, slot_banks: dict, sidecar: StreamingExpertSidecar) -> None:
-    """Walk model.layers, replace each SwitchLinear.__call__ with closure over slot bank.
-    After patching, free original 3D weight tensors (gate/up/down = None; mx.eval()).
+def build_slot_banks(model, sidecar, cfg) -> dict[str, ExpertSlotBank]:
+    """Walk model.layers, instantiate one ExpertSlotBank per SwitchGLU layer.
+    Slot bank constructor calls read_expert_into for hot tier initialization.
     """
 ```
 
@@ -330,58 +369,94 @@ layer.mlp.switch_mlp.down_proj = None
 mx.eval()  # flush graph, release Metal buffers
 ```
 
-### 3c. Patched `__call__`
+### 3c. Patched `__call__` — MLX functional assembly
 
 ```python
 def _streaming_switch_linear_call(self, x, indices):
-    """x: (B,S,H), indices: (B,S,top_k) already eval'd.
+    """x: (B,S,H), indices: (B,S,top_k) — routing indices as raw MLX tensor.
     Protocol:
-      1. slot_bank.resolve(indices.flatten().tolist()) → (stacked_weights, slot_ids)
-      2. mx.gather_qmm(x, stacked_weights, rhs_indices=slot_ids, ...)
-      3. Return output
-    Do not call mx.eval() inside — caller owns the sync gate.
+      1. Consume routing indices as raw tensor — NO .tolist(), NO .item(),
+         NO conditional checks on unmaterialized values. Indices flow
+         directly to slot_bank.resolve() as an mx.array.
+      2. slot_bank.resolve(indices) → (stacked_weights: mx.array, slot_ids: list[int])
+         The slot bank manages in-place buffer writes via C++ pread_into_array.
+         patch.py does NOT touch buffers directly.
+      3. mx.gather_qmm(x, stacked_weights, rhs_indices=slot_ids, ...)
+         Maps token activations to slot-bank views using gather_qmm.
+      4. Return output — do NOT call mx.eval() inside. Caller owns the sync gate.
     """
+```
+
+**Token Slicing / Index Extraction:** Instead of using `.tolist()` to extract expert IDs from the routing indices tensor, the slot-bank resolution logic must ingest the indices as a raw tensor. The `resolve()` method receives routing indices as an `mx.array` and extracts slot lookups through direct C++ iteration or functional MLX operations. This preserves asynchronous execution entirely.
+
+**In-Place Buffer Management:** The `ExpertSlotBank` handles memory mapping and pointer-level writes at the C++ level (Phase 2b). `patch.py` simply manages graph assembly by mapping incoming token activations to slot-bank views using `mx.gather_qmm`. No Python buffer manipulation occurs in the hot path.
+
+### 3d. Unpatch helper (restoration)
+
+```python
+def unpatch_switch_linear(self, original_call):
+    """Restore original __call__ and reinstate expert weights."""
+```
+
+### 3e. Apply streaming patches to model
+
+```python
+def apply_streaming_patches(model, slot_banks):
+    """Patch all SwitchGLU layers in a model at once."""
 ```
 
 ---
 
-## Phase 4: Model Loading Integration
+## Phase 4: Model Loading Integration — **IMPLEMENTED**
 
-### 4a. Config schema
-
-```json
-{
-  "stream_experts": false,
-  "expert_sidecar_path": null,
-  "expert_hot_count": 13,
-  "expert_warm_slots": 64,
-  "expert_transient_slots": 8,
-  "expert_prefetch": true,
-  "expert_prefetch_window": 4,
-  "expert_top_k_override": null
-}
-```
-
-`stream_experts: false` is default. Must be explicit opt-in per model. No auto-detect-and-enable.
-
-### 4b. Sidecar auto-detection
-
-If `stream_experts: true` and `expert_sidecar_path` is null: check `{model_dir}/{model_name}.streaming`. Log resolved path.
-
-### 4c. BatchedEngine integration
+### 4a. Config schema (`config.py`)
 
 ```python
-if cfg.stream_experts:
-    sidecar = StreamingExpertSidecar(resolve_sidecar_path(cfg))
-    slot_banks = build_slot_banks(model, sidecar, cfg)
-    patch_switch_linear(model, slot_banks, sidecar)
+@dataclass
+class StreamingConfig:
+    stream_experts: bool = False
+    expert_sidecar_path: str | None = None
+    expert_hot_count: int = 13
+    expert_warm_slots: int = 64
+    expert_transient_slots: int = 8
+    expert_prefetch: bool = True
+    expert_prefetch_window: int = 4
+    expert_top_k_override: int | None = None
+    calibration_frequencies: dict[int, float] | None = None
 ```
 
-### 4d. CLI command
+`stream_experts: false` is default. Must be explicit opt-in per model.
 
-`omlx create-sidecar <model_path> [--output <path>] [--alignment 16384]`
+### 4b. Sidecar resolution (`pipeline.py:resolve_sidecar_path`)
 
-Progress bar (tqdm) over layers. Print final sidecar size and expert count.
+Auto-detects `{model_dir}/{model_name}.streaming` with fallback search. Explicit path override via `expert_sidecar_path`.
+
+### 4c. BatchedEngine integration (`engine/batched.py`)
+
+Added `streaming_config` parameter to `BatchedEngine.__init__()`. In `start()`:
+```python
+if streaming_config is not None and streaming_config.stream_experts:
+    self._streaming_state = load_model_with_streaming(
+        model, cfg=streaming_config, model_name_or_path=self._model_name,
+    )
+```
+
+In `stop()`:
+```python
+if self._streaming_state is not None:
+    unload_streaming(self._model)
+```
+
+### 4d. CLI command (`cli.py`)
+
+`omlx create-sidecar <model_path> [-o <path>] [--alignment 16384] [--no-verify]`
+
+### 4e. Pipeline orchestrator (`pipeline.py`)
+
+- `load_model_with_streaming()`: Opens sidecar → builds slot banks per layer → applies streaming patches → returns state dict
+- `streaming_forward_pass()`: I2-compliant hot-path entry point for per-layer MoE forward
+- `EMATrajectoryPrefetcher`: EMA tracking with `predict()` and `prefetch()` methods
+- `unload_streaming()`: Removes patches, restores original `__call__`
 
 ---
 
@@ -495,6 +570,7 @@ These are architectural risks. Do not paper over with assumptions.
 | Q2 | **`mx.eval()` drain guarantee** — does it fully wait for Metal completion? | Submit gather_qmm, mx.eval() its inputs (not output), immediately overwrite input buffer, run gather_qmm again. Corrupted outputs → need mx.synchronize(). |
 | Q3 | **16KB vs 4KB Metal alignment** — what does `newBufferWithBytesNoCopy` actually require? | Experiment with both alignments on target hardware. If 4KB sufficient, change `_DEFAULT_ALIGNMENT` to 4096 (saves 75% padding). |
 | Q4 | **F_NOCACHE under memory pressure** — does `os.pread()` latency stay < 2ms per chunk under concurrent memory compression? | Test with 48 GB RAM + 209 GB model + active memory compressor. If latency spikes, GPU starvation is worse than estimated. |
+| Q5 | **Sequential `mx.gather_qmm` overlapping views** — how does the MLX execution graph behave when multiple sequential `mx.gather_qmm` operations reference overlapping views of the same underlying physical buffer across different layers? | Run two consecutive layers with `gather_qmm` reading from the same warm slot buffer. Compare output against sequential baseline. If outputs diverge, the graph may be reading stale or partially-written buffer state — requires explicit `mx.eval()` fencing between layers or per-layer buffer pinning. |
 
 ---
 
