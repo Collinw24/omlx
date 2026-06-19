@@ -542,17 +542,14 @@ class StreamingExpertSidecar:
         """
         offset, length = self._resolve_offset_len(layer, expert)
 
-        if hasattr(os, "preadv"):
-            # Python 3.12+: single syscall, no intermediate bytes allocation.
-            # preadv reads directly into a slice of the pre-allocated buffer.
-            target = buf[buf_offset : buf_offset + length]
-            nread = os.preadv(self._fd, [target], offset)
-        else:
-            # Fallback: pread into a temporary bytes object, then copy into
-            # the pre-allocated buffer.
-            raw = os.pread(self._fd, length, offset)
-            nread = len(raw)
-            buf[buf_offset : buf_offset + nread] = raw
+        # Use the pread_into_array function which handles all buffer types
+        # (mx.array, bytearray, memoryview, numpy.ndarray) via the Python
+        # buffer protocol.  The C++ extension writes directly into the
+        # backing buffer with zero intermediate allocations; the pure Python
+        # fallback allocates a temporary bytes object per call.
+        from . import pread_into_array as _pread_into
+
+        nread = _pread_into(self._fd, offset, length, buf, buf_offset)
 
         if nread != length:
             raise RuntimeError(
@@ -660,6 +657,8 @@ class StreamingExpertSidecar:
         model_path: str | Path,
         output_path: str | Path,
         alignment: int = _DEFAULT_ALIGNMENT,
+        quant: int | None = None,
+        quant_group_size: int = 64,
     ) -> "StreamingExpertSidecar":
         """Scan safetensors in *model_path*, extract expert weights, and write
         a contiguous sidecar file to *output_path*.
@@ -681,6 +680,14 @@ class StreamingExpertSidecar:
         alignment:
             Byte alignment for expert chunks (default 16384 for Apple Silicon
             16 KiB page alignment).
+        quant:
+            Quantize expert weights to this many bits (e.g. 4 for 4-bit).
+            When ``None`` (default), weights are stored as float32.
+            When set, weights are packed in MLX's quantised layout so the
+            streaming pipeline can dispatch ``mx.gather_qmm`` for fused
+            dequant + gather + matmul.
+        quant_group_size:
+            Group size for quantisation (default 64, used when *quant* is set).
 
         Returns
         -------
@@ -868,6 +875,117 @@ class StreamingExpertSidecar:
                     lk, lk_progress,
                 )
 
+            # ── Phase 4b: Quantisation post-processing (optional) ────────
+            if quant is not None and quant > 0:
+                import mlx.core as _mx
+                import numpy as _np
+
+                logger.info(
+                    "Quantising expert weights to %d-bit (group_size=%d) ...",
+                    quant, quant_group_size,
+                )
+
+                # Determine segment layout from first layer's metadata.
+                # For Qwen-style (dimension-based): each expert stores
+                # gate(M,H) + up(M,H) + down(H,M) as contiguous float32.
+                # For key-based: each projection is separate but still
+                # packed contiguously in the chunk.
+                #
+                # We read the actual weight shapes from the combined dict
+                # to get exact segment sizes.  Fallback: 3 equal parts.
+                #
+                # For each projection we:
+                #   1. Convert raw float32 bytes → mx.array
+                #   2. Call mx.quantize(weight, group_size, bits)
+                #   3. Pack qw + scales + biases back as bytes
+                #   4. Update the chunk and length
+
+                for i, (lk, ei, _offset, _length, chunk) in enumerate(
+                    expert_layout
+                ):
+                    # Build a list of (proj_name, shape) from the
+                    # combined dict for this (layer, expert).
+                    proj_shapes: list[tuple[str, int, int]] = []
+                    for (
+                        (_li, pn, _cat, _ei),
+                        rec,
+                    ) in combined.items():
+                        # Match by layer key string
+                        lk_from_idx = layer_key_map.get(_li, "")
+                        if lk_from_idx == lk and _cat == "weight":
+                            shape = rec[4]
+                            if len(shape) >= 2:
+                                if is_dimension_based:
+                                    # shape = (e, M, H) — take dims 1,2
+                                    proj_shapes.append(
+                                        (pn, int(shape[1]), int(shape[2]))
+                                    )
+                                else:
+                                    # shape = (M, H) or (H, M)
+                                    proj_shapes.append(
+                                        (pn, int(shape[0]), int(shape[1]))
+                                    )
+
+                    if not proj_shapes:
+                        logger.debug(
+                            "Layer %s expert %d: no projections found, "
+                            "skipping quant",
+                            lk, ei,
+                        )
+                        continue
+
+                    # Sort: gate, up, down (standard order)
+                    order = {"gate_proj": 0, "up_proj": 1, "down_proj": 2}
+                    proj_shapes.sort(key=lambda x: order.get(x[0], 99))
+
+                    packed_chunks: list[bytes] = []
+                    byte_offset = 0
+                    for pn, rows, cols in proj_shapes:
+                        seg_size = rows * cols * 4  # float32 bytes
+                        raw = chunk[byte_offset : byte_offset + seg_size]
+                        byte_offset += seg_size
+
+                        # Reshape raw bytes → float32 mx.array
+                        # Use numpy for byte reinterpretation since
+                        # MLX lacks ``frombuffer``.
+                        w_np = _np.frombuffer(raw[:seg_size], dtype=_np.float32).reshape(rows, cols)
+                        w = _mx.array(w_np)
+
+                        qw, scales, biases = _mx.quantize(
+                            w, group_size=quant_group_size, bits=quant
+                        )
+
+                        # Convert to numpy and reinterpret as uint8 bytes.
+                        # Note: ``.astype(mx.uint8)`` does element-wise
+                        # conversion (wrong for uint32→uint8); we use
+                        # numpy's ``.view(np.uint8)`` for true byte
+                        # reinterpretation.
+                        qw_np = _np.asarray(_mx.array(qw))
+                        sc_np = _np.asarray(_mx.array(scales))
+                        bi_np = _np.asarray(_mx.array(biases))
+                        packed_chunks.append(
+                            qw_np.view(_np.uint8).tobytes()
+                            + sc_np.view(_np.uint8).tobytes()
+                            + bi_np.view(_np.uint8).tobytes()
+                        )
+
+                    repacked = b"".join(packed_chunks)
+                    expert_layout[i] = (lk, ei, _offset, len(repacked), repacked)
+
+            # Recompute offsets and add alignment padding for quantized
+            # chunks — the original offsets/padding were based on float32
+            # sizes, and qw+sc+bi have different byte counts.
+            if quant is not None and quant > 0:
+                new_offset = expert_layout[0][2] if expert_layout else 0
+                for i, (lk, ei, _old_off, new_len, chunk) in enumerate(
+                    expert_layout
+                ):
+                    padded = _align_up(new_len, alignment)
+                    padding_needed = padded - new_len
+                    padded_chunk = chunk + (b"\x00" * padding_needed) if padding_needed > 0 else chunk
+                    expert_layout[i] = (lk, ei, new_offset, new_len, padded_chunk)
+                    new_offset += padded
+
             # ── Phase 5: Finalize header with real expert offsets ───────
             header_dict: dict[str, Any] = {
                 "version": 1,
@@ -884,6 +1002,16 @@ class StreamingExpertSidecar:
                     for lk in (layer_key_map[li] for li in sorted_layers)
                 },
             }
+            # Add quantisation metadata to header if active.
+            if quant is not None and quant > 0:
+                _qm: dict[str, Any] = {
+                    "bits": quant,
+                    "group_size": quant_group_size,
+                    "mode": "affine",
+                }
+                for lk in header_dict["layers"]:
+                    header_dict["layers"][lk]["quant"] = dict(_qm)
+
             for lk, ei, offset, length, _chunk in expert_layout:
                 header_dict["layers"][lk]["experts"][str(ei)] = {
                     "offset": offset,
@@ -1013,6 +1141,11 @@ def create_sidecar(
     model_path: str | Path,
     output_path: str | Path,
     alignment: int = _DEFAULT_ALIGNMENT,
+    quant: int | None = None,
+    quant_group_size: int = 64,
 ) -> StreamingExpertSidecar:
     """Convenience wrapper for :meth:`StreamingExpertSidecar.create`."""
-    return StreamingExpertSidecar.create(model_path, output_path, alignment)
+    return StreamingExpertSidecar.create(
+        model_path, output_path, alignment,
+        quant=quant, quant_group_size=quant_group_size,
+    )
