@@ -744,6 +744,73 @@ def diagnose_command(args) -> int:
     return 1
 
 
+def create_sidecar_command(args) -> int:
+    """Handler for the ``create-sidecar`` CLI subcommand.
+
+    Builds an SSD expert streaming sidecar from model .safetensors files,
+    enabling F_NOCACHE direct I/O for expert weight streaming.
+    """
+    from .streaming import create_sidecar as _create_sidecar
+
+    model_path = args.model_path
+    output_path = args.output
+    alignment = args.alignment
+    verify = args.verify
+
+    print(f"Creating sidecar for model at: {model_path}")
+    print(f"  Alignment: {alignment} bytes")
+    print(f"  Verify: {verify}")
+    if output_path:
+        print(f"  Output: {output_path}")
+
+    try:
+        sidecar = _create_sidecar(
+            model_path=model_path,
+            output_path=output_path,
+            alignment=alignment,
+            quant=getattr(args, "quant", None),
+            quant_group_size=getattr(args, "quant_group_size", 64),
+        )
+        print(f"\nSidecar created: {sidecar}")
+
+        if verify:
+            print("\nVerifying sidecar...")
+            from .streaming.sidecar import StreamingExpertSidecar
+            sc = StreamingExpertSidecar(sidecar)
+            num_layers = sc.header.get("num_layers", 0)
+            num_experts = sc.header.get("num_experts", 0)
+            expert_bytes = 0
+            layer0 = sc.header.get("layers", {}).get("0", {})
+            if layer0:
+                exp0 = layer0.get("experts", {}).get("0", {})
+                expert_bytes = exp0.get("length", 0)
+            print(f"  Layers: {num_layers}")
+            print(f"  Experts per layer: {num_experts}")
+            print(f"  Bytes per expert: {expert_bytes}")
+
+            # Verify F_NOCACHE is active
+            if sc.nocache_active:
+                print(f"  F_NOCACHE: active (direct I/O)")
+            else:
+                print(f"  F_NOCACHE: inactive (buffered I/O)")
+
+            # Read sample expert from layer 0, expert 0
+            try:
+                sample = sc.read_expert(0, 0)
+                print(f"  Sample read: {len(sample)} bytes (OK)")
+            except Exception as e:
+                print(f"  Sample read FAILED: {e}")
+
+            sc.close()
+
+        print(f"\nDone. Sidecar ready for streaming.")
+        return 0
+
+    except Exception as e:
+        print(f"Error creating sidecar: {e}")
+        return 1
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="omlx: Production-ready LLM server for Apple Silicon",
@@ -1041,6 +1108,50 @@ Example directory structure:
         help="Claude Code Haiku tier model (Claude integration only)",
     )
 
+    # Create-sidecar command
+    sc_parser = subparsers.add_parser(
+        "create-sidecar",
+        help="Create an SSD expert streaming sidecar for a model",
+        description="Builds a sidecar file from model .safetensors so expert "
+        "weights can be streamed directly from NVMe via F_NOCACHE I/O.",
+    )
+    sc_parser.add_argument(
+        "model_path",
+        type=str,
+        help="Path to model directory containing .safetensors files",
+    )
+    sc_parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default=None,
+        help="Output path for the sidecar file (default: {model_dir}/{model_name}.streaming)",
+    )
+    sc_parser.add_argument(
+        "--alignment",
+        type=int,
+        default=16384,
+        help="Byte alignment for expert data blocks (default: 16384)",
+    )
+    sc_parser.add_argument(
+        "--no-verify",
+        action="store_false",
+        dest="verify",
+        help="Skip post-creation verification",
+    )
+    sc_parser.add_argument(
+        "--quant",
+        type=int,
+        default=None,
+        help="Quantise expert weights to N bits (e.g. 4 for 4-bit, default: no quant)",
+    )
+    sc_parser.add_argument(
+        "--quant-group-size",
+        type=int,
+        default=64,
+        help="Group size for quantisation (default: 64)",
+    )
+
     # Diagnose command
     diagnose_parser = subparsers.add_parser(
         "diagnose",
@@ -1068,6 +1179,8 @@ Example directory structure:
             serve_command(args)
         elif args.command in {"start", "stop", "restart"}:
             sys.exit(lifecycle_command(args))
+        elif args.command == "create-sidecar":
+            sys.exit(create_sidecar_command(args))
         elif args.command == "diagnose":
             sys.exit(diagnose_command(args))
         else:

@@ -46,6 +46,7 @@ class BatchedEngine(BaseEngine):
         enable_thinking: bool | None = None,
         model_settings: Any | None = None,
         prefill_eviction_callback: Any | None = None,
+        streaming_config: Any | None = None,
     ):
         """
         Initialize the batched engine.
@@ -57,6 +58,9 @@ class BatchedEngine(BaseEngine):
             stream_interval: Tokens to batch before streaming (1=every token)
             enable_thinking: Enable thinking mode for reasoning models (passed to chat_template_kwargs)
             model_settings: Optional per-model settings for post-load transforms
+            streaming_config: Optional StreamingConfig for SSD expert streaming.
+                When ``None`` or ``stream_experts=False``, the feature is inert
+                (zero overhead in the forward path).
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -65,11 +69,13 @@ class BatchedEngine(BaseEngine):
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
         self._prefill_eviction_callback = prefill_eviction_callback
+        self._streaming_config = streaming_config
 
         self._model = None
         self._tokenizer = None
         self._engine = None
         self._loaded = False
+        self._streaming_state = None
         self._grammar_compiler = None
         self._grammar_compiler_init_attempted = False
 
@@ -104,6 +110,11 @@ class BatchedEngine(BaseEngine):
     def tokenizer(self) -> Any:
         """Get the tokenizer."""
         return self._tokenizer
+
+    @property
+    def streaming_state(self) -> dict | None:
+        """Get the current streaming state, or ``None`` if not active."""
+        return self._streaming_state
 
     @property
     def model_type(self) -> str | None:
@@ -288,6 +299,29 @@ class BatchedEngine(BaseEngine):
             get_mlx_executor(), materialize_lazy_state, self._model
         )
 
+        # ── SSD Expert Streaming setup ────────────────────────────────
+        # If streaming config is provided and enabled, load sidecar, build
+        # slot banks, and apply streaming patches.  When disabled, this
+        # entire block is a no-op (I5: inert when disabled).
+        if self._streaming_config is not None and hasattr(
+            self._streaming_config, "stream_experts"
+        ):
+            if self._streaming_config.stream_experts:
+                from ..streaming import load_model_with_streaming
+
+                self._streaming_state = load_model_with_streaming(
+                    self._model,
+                    cfg=self._streaming_config,
+                    model_name_or_path=self._model_name,
+                )
+                logger.info(
+                    "Expert streaming active: %d slot banks built.",
+                    len(
+                        self._streaming_state.get("slot_banks", {})
+                    ),
+                )
+        # ── End streaming setup ────────────────────────────────────────
+
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
@@ -401,6 +435,16 @@ class BatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
+        # Clean up streaming resources first
+        if self._streaming_state is not None and self._model is not None:
+            try:
+                from ..streaming import unload_streaming
+
+                unload_streaming(self._model)
+            except Exception as e:
+                logger.warning(f"Error cleaning up streaming state: {e}")
+            self._streaming_state = None
+
         if self._engine:
             await self._engine.stop()
             if hasattr(self._engine, "engine") and self._engine.engine is not None:
@@ -946,7 +990,15 @@ class BatchedEngine(BaseEngine):
             "model_name": self._model_name,
             "loaded": self._loaded,
             "stream_interval": self._stream_interval,
+            "streaming_active": (
+                self._streaming_state is not None
+                and self._streaming_state.get("active", False)
+            ),
         }
+        if stats["streaming_active"]:
+            stats["streaming_slot_banks"] = len(
+                self._streaming_state.get("slot_banks", {})
+            )
         if self._engine:
             stats.update(self._engine.get_stats())
         return stats

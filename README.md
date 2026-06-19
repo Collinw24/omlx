@@ -320,6 +320,46 @@ omlx serve --model-dir ~/models --api-key your-secret-key
 All settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
 
 <details>
+<summary>SSD Expert Streaming (Experimental)</summary>
+
+Run massive Mixture-of-Experts models (Qwen3.5-397B-A17B, 209 GB) on 48-64 GB
+Apple Silicon by streaming only the top-K active expert weights from NVMe SSD
+per token, bypassing the macOS Unified Buffer Cache (UBC) via F_NOCACHE direct I/O.
+
+### How it works
+
+1. **Create a sidecar:** `omlx create-sidecar ./my_model/ --quant 4` — extracts expert
+   weights from .safetensors into a packed, 16KB-aligned sidecar file with F_NOCACHE.
+2. **Enable streaming:** Set `"stream_experts": true` in the model's settings.
+3. **Forward pass:** Per token, only the top-K experts (typically 8) are streamed from
+   NVMe into pre-allocated Metal GPU buffers — the remaining 248 experts stay on disk.
+
+### Architecture
+
+```
+.safetensors → create-sidecar → sidecar file (F_NOCACHE, 16KB aligned)
+                                    ↓
+    ExpertSlotBank (per-layer, 3-tier GPU memory pool)
+      Hot (13, pinned) → Warm (64, LRU+EMA) → Transient (8, circular)
+                                    ↓
+    mx.gather_qmm: fused dequant + gather + matmul in one Metal kernel
+```
+
+### Integration
+Enable per-model via the admin panel or cli:
+```bash
+omlx serve --model-dir ~/models --stream-experts \
+  --expert-hot-count 13 --expert-warm-slots 64 --expert-transient-slots 8
+```
+
+**Status:** Experimental. Float32 path is validated (17/17 tests, layer-level
+correctness at atol=1e-4). Quantized gather_qmm path is partially implemented
+(dispatch works, scales/biases extraction done). Requires at least 32 GB RAM
+for the float32 reduction and a fast NVMe SSD.
+
+</details>
+
+<details>
 <summary>Architecture</summary>
 
 ```
