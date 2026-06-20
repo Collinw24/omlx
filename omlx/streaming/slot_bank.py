@@ -174,6 +174,16 @@ class ExpertSlotBank:
             "Initialized Hot Tier with %d experts based on calibration.", len(self._hot_map)
         )
 
+    def set_layer(self, layer: int | str) -> None:
+        """Point this slot bank at a different layer in the sidecar.
+
+        When one slot bank is shared across all layers (the default),
+        this is called per-token per-layer before ``resolve()`` to
+        ensure ``_load_expert_into_buffer`` reads from the correct
+        layer in the sidecar file.
+        """
+        self.layer = layer
+
     def resolve(self, expert_ids: List[int]) -> Tuple[mx.array, List[int]]:
         """
         Resolves expert IDs to slot indices and returns stacked weights.
@@ -208,6 +218,11 @@ class ExpertSlotBank:
             RuntimeError: When the number of cold experts in a single
             ``resolve()`` call exceeds ``transient_slots``.
         """
+        # Update the sidecar layer pointer for shared slot bank usage.
+        # In a multi-layer model, all layers share one slot bank;
+        # set_layer is called each token per layer from the patched
+        # ``__call__``.
+
         # Debug sync gate check (I2)
         if _sys_os.environ.get("OMLX_STREAMING_STRICT") == "1":
             _assert_graph_drained()

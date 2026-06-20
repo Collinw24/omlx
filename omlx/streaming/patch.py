@@ -139,6 +139,8 @@ def _streaming_switch_linear_call(
 
     stacked: mx.array
     slot_ids: List[int]
+    # Point shared slot bank at this layer
+    slot_bank.set_layer(layer)
     stacked, slot_ids = slot_bank.resolve(unique_experts)
 
     # Record routing for EMA prefetcher (Priority 2)
@@ -359,6 +361,7 @@ def patch_switch_linear(
     sidecar: StreamingExpertSidecar,
     layer: int | str,
     expert_bytes: int,
+    slot_bank: ExpertSlotBank,
     hot_count: int = 13,
     warm_slots: int = 64,
     transient_slots: int = 8,
@@ -366,6 +369,10 @@ def patch_switch_linear(
     routing_callback: Optional[Callable[[int, List[int]], None]] = None,
 ) -> None:
     """Patch a ``SwitchGLU`` (or equivalent) module for expert streaming.
+
+    Uses a shared *slot_bank* (one per model, not one per layer) to avoid
+    pre-allocating N slot banks for N layers — critical for 397B with 80
+    layers.
 
     Parameters
     ----------
@@ -419,17 +426,7 @@ def patch_switch_linear(
     # sidecar.py), this will need to load scales, biases, bits and pass
     # them to ``mx.gather_qmm``.
 
-    # ── 3. Create the slot bank ──────────────────────────────────────
-    slot_bank = ExpertSlotBank(
-        sidecar=sidecar,
-        layer=layer,
-        expert_bytes=expert_bytes,
-        hot_count=hot_count,
-        warm_slots=warm_slots,
-        transient_slots=transient_slots,
-        calibration_frequencies=calibration_frequencies,
-    )
-
+    # ── 3. Use the shared slot bank ─────────────────────────────────
     module._omlx_slot_bank = slot_bank
     module._omlx_sidecar = sidecar
 
@@ -529,10 +526,22 @@ def apply_streaming_patches(
     if layer_indices is None:
         layer_indices = list(range(len(layers)))
 
+    # Shared slot bank — ONE bank for ALL layers to avoid pre-allocating
+    # N banks for N layers (critical for 397B with 80+ layers).
+    first_layer_key = str(layer_indices[0])
+    shared_expert_bytes = sidecar.header["layers"][first_layer_key]["experts"]["0"]["length"]
+    slot_bank = ExpertSlotBank(
+        sidecar=sidecar,
+        layer=int(first_layer_key),
+        expert_bytes=shared_expert_bytes,
+        hot_count=hot_count,
+        warm_slots=warm_slots,
+        transient_slots=transient_slots,
+        calibration_frequencies=calibration_frequencies,
+    )
+
     for layer_idx in layer_indices:
         layer = layers[layer_idx]
-        # Discover the MoE submodule — could be ``layer.mlp.switch_mlp``,
-        # ``layer.mlp.switch_linear``, or directly ``layer`` itself.
         target = None
         for attr in ("mlp", "moe"):
             mlp = getattr(layer, attr, None)
@@ -545,28 +554,23 @@ def apply_streaming_patches(
                     break
             if target is not None:
                 break
-
-        # Fallback: the layer itself might be the MoE module.
         if target is None and _is_switch_glu(layer):
             target = layer
-
         if target is None:
-            logger.debug(
-                "Skipping layer %d — no SwitchGLU/SwitchLinear found.",
-                layer_idx,
-            )
+            logger.debug("Skipping layer %d — no SwitchGLU.", layer_idx)
             continue
 
         patch_switch_linear(
             module=target,
             sidecar=sidecar,
             layer=layer_idx,
-            expert_bytes=sidecar.header["layers"][str(layer_idx)]
-            ["experts"]["0"]["length"],
+            expert_bytes=sidecar.header["layers"][str(layer_idx)]["experts"]["0"]["length"],
+            slot_bank=slot_bank,
             hot_count=hot_count,
             warm_slots=warm_slots,
             transient_slots=transient_slots,
             calibration_frequencies=calibration_frequencies,
+            routing_callback=routing_callback,
         )
 
     logger.info(

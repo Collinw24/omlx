@@ -46,9 +46,9 @@ class StreamingConfig:
 
     stream_experts: bool = False
     expert_sidecar_path: Optional[str] = None
-    expert_hot_count: int = 13
-    expert_warm_slots: int = 64
-    expert_transient_slots: int = 8
+    expert_hot_count: int = 8
+    expert_warm_slots: int = 16
+    expert_transient_slots: int = 4
     expert_prefetch: bool = True
     expert_prefetch_window: int = 4
     expert_top_k_override: Optional[int] = None
