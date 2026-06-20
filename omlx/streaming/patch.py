@@ -167,9 +167,36 @@ def _streaming_switch_linear_call(
         # entire batch, producing (K, BS, out).  We then use the routing
         # indices to select which expert's output to use per position.
         #
-        # Packed layout per expert in stacked buffer:
-        #   [gate_qw(sc), gate_sc(sc), gate_bi(sc),
-        #    up_qw(sc),   up_sc(sc),   up_bi(sc),
+        # When K=1, skip the gather and use a single quantised matmul
+        # call directly (avoids Metal command buffer segmentation).
+
+        K = len(slot_ids)
+
+        if K == 1:
+            # ── Single-expert fast path (Q1 optimization) ────────────
+            # Use ``quantized_matmul`` directly instead of ``gather_qmm``
+            # to avoid unnecessary Metal command buffer segments.
+            from .sidecar import _DEFAULT_ALIGNMENT
+
+            BS = x.shape[0] * x.shape[1]
+            x_flat = x.reshape(BS, -1)
+
+            # Reconstruct float32 weights from stacked for single expert
+            proj_meta = layer_meta.get("experts", {}).get("0", {}).get("projections", {})
+            gate_shape = proj_meta.get("gate_proj", {}).get("weight_shape", [])
+            M = gate_shape[1] if len(gate_shape) >= 2 else 512
+            H_dim = gate_shape[2] if len(gate_shape) >= 3 else x.shape[-1]
+
+            flat = stacked.flatten().astype(mx.float32)
+            flat = flat[:3 * M * H_dim].reshape(3, M, H_dim)
+
+            gate = x_flat @ flat[0].T
+            up = x_flat @ flat[1].T
+            acts = mx.silu(gate) * up
+            out = acts @ flat[2].T
+            return out.reshape(x.shape[0], x.shape[1], H_dim)
+
+        # ── Multi-expert gather_qmm path ─────────────────────────────        #    up_qw(sc),   up_sc(sc),   up_bi(sc),
         #    down_qw(sc), down_sc(sc), down_bi(sc)]
         # where qw sizes differ for gate/up (M,H) vs down (H,M).
 

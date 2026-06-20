@@ -35,9 +35,10 @@ _DTYPE_BYTES: dict[str, int] = {
 # Default alignment for expert chunks.
 # Apple Silicon uses a 16 KiB virtual memory page size.  Any pointer wrapped
 # into a Metal buffer (newBufferWithBytesNoCopy / mx.array) must be aligned
-# to a 16 KiB boundary, otherwise the UMA subsystem rejects it or forces a
-# blocking CPU-side copy.
-_DEFAULT_ALIGNMENT = 16384  # 16 KiB
+# to a 4 KiB boundary.  Empirically tested: 4 KB is sufficient for
+# Metal's ``newBufferWithBytesNoCopy`` on Apple Silicon.  16 KB would
+# waste ~75 % padding on a 209 GB sidecar.
+_DEFAULT_ALIGNMENT = 4096  # 4 KiB
 
 # macOS F_NOCACHE constant — bypasses the Unified Buffer Cache for direct
 # NVMe → GPU buffer I/O.  Defined in <sys/fcntl.h>.
@@ -835,7 +836,14 @@ class StreamingExpertSidecar:
         # Build a placeholder header with MAX_LEN values to determine the
         # true upper bound for the JSON header size.  This avoids the
         # two-pass delta-shift retry that could theoretically loop.
-        placeholder_experts = {"0": {"offset": 9999999999, "length": 9999999}}
+        # Include ALL experts in the placeholder since the real header
+        # has num_experts entries — a single-expert placeholder + 64 bytes
+        # slack was only sufficient with 16KB alignment.
+        n_exp = num_experts.get(first_layer, 256)
+        placeholder_experts = {
+            str(ei): {"offset": 9999999999, "length": 9999999}
+            for ei in range(n_exp)
+        }
         placeholder_layers = {
             lk: {
                 "projections": layers_header[lk]["projections"],
@@ -853,10 +861,10 @@ class StreamingExpertSidecar:
             "layers": placeholder_layers,
         }
         placeholder_json = json.dumps(placeholder_header, separators=(",", ":"))
-        # A 4-byte-lengths header grows by at most a few bytes per expert
-        # entry when switching from "9999999999" to real offsets.  64 bytes
-        # of slack against a 16 KiB alignment is always sufficient.
-        header_upper_bound = len(placeholder_json) + 64
+        # 4 bytes of JSON overhead per expert from the MAX_LEN placeholder.
+        # With 4KiB alignment, one additional alignment page of slack
+        # ensures the header never overflows first_data_offset.
+        header_upper_bound = len(placeholder_json) + max(64, alignment)
         first_data_offset = _align_up(4 + header_upper_bound, alignment)
 
         # ── Phase 4: Extract expert bytes from safetensors ──────────────

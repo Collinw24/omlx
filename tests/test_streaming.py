@@ -195,7 +195,9 @@ class TestSidecarAlignment:
         try:
             # Expert 0 in first layer
             e0_offset = sc.header["layers"]["0"]["experts"]["0"]["offset"]
-            assert e0_offset == 16384, f"Expert 0 offset is {e0_offset}, expected 16384"
+            assert e0_offset % 4096 == 0, (
+        f"Expert 0 offset {e0_offset} is not 4KB-aligned (expected multiple of 4096)"
+    )
         finally:
             sc.close()
 
@@ -208,8 +210,8 @@ class TestSidecarAlignment:
             for lk, layer_data in sc.header["layers"].items():
                 for ek, expert_data in layer_data["experts"].items():
                     offset = expert_data["offset"]
-                    assert offset % 16384 == 0, (
-                        f"Layer {lk} Expert {ek} offset {offset} not aligned to 16384"
+                    assert offset % 4096 == 0, (
+                        f"Layer {lk} Expert {ek} offset {offset} not aligned to 4096"
                     )
         finally:
             sc.close()
