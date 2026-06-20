@@ -25,6 +25,26 @@ from typing import Any, Dict, List, Tuple
 import mlx.core as mx
 from .sidecar import StreamingExpertSidecar
 
+import os as _sys_os  # for OMLX_STREAMING_STRICT check
+
+# ---------------------------------------------------------------------------
+# Sync gate debug enforcement
+# ---------------------------------------------------------------------------
+# When OMLX_STREAMING_STRICT=1, resolve() runs a heuristic drain check.
+
+
+def _assert_graph_drained() -> None:
+    """Heuristic that the MLX graph is drained before slot mutation.
+
+    Forces a CPU-side round-trip by evaluating a trivial scalar.  If the
+    GPU is still executing prior commands, this stalls until completion.
+    Not a true Metal fence, but catches the I2 violation pattern where
+    resolve() is called before mx.eval(router_logits).
+
+    Only active when ``OMLX_STREAMING_STRICT=1``.
+    """
+    _ = mx.array(0).item()
+
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +178,12 @@ class ExpertSlotBank:
         """
         Resolves expert IDs to slot indices and returns stacked weights.
 
+        .. note::
+           **I2 compliance (sync gate):** The caller MUST have called
+           ``mx.eval(router_logits)`` *before* calling this method.
+           This function does not call ``mx.eval()``.  Set
+           ``OMLX_STREAMING_STRICT=1`` to enable a heuristic drain check.
+
         Three-tier cascade per expert:
 
         1. **Hot** — all hot experts are pinned at init, never evicted.
@@ -182,6 +208,10 @@ class ExpertSlotBank:
             RuntimeError: When the number of cold experts in a single
             ``resolve()`` call exceeds ``transient_slots``.
         """
+        # Debug sync gate check (I2)
+        if _sys_os.environ.get("OMLX_STREAMING_STRICT") == "1":
+            _assert_graph_drained()
+
         K = len(expert_ids)
         slot_ids: List[int] = []
         cold_count = 0

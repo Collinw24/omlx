@@ -91,6 +91,50 @@ _EXPERT_KEY_PARSERS: list[tuple[str, int, int, int, int | None, str]] = [
 _MIXTRAL_PROJ_MAP: dict[str, str] = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
 
 
+def register_parser(
+    arch_name: str,
+    regex: str,
+    layer_group: int,
+    proj_group: int,
+    cat_group: int,
+    expert_group: int | None = None,
+) -> None:
+    """Register a new expert tensor key pattern for a model architecture.
+
+    Parameters
+    ----------
+    arch_name:
+        Human-readable name (e.g. "phi_moe", "gemma_moe").
+    regex:
+        Full regex matching an expert tensor key.  Must capture: layer index,
+        projection name (gate/up/down), category (weight/scales/biases).  For
+        per-expert-per-key layouts (DeepSeek/Mixtral), also capture expert index.
+    layer_group:
+        Regex group index for the layer number.
+    proj_group:
+        Regex group index for the projection (gate_proj / up_proj / down_proj).
+    cat_group:
+        Regex group index for the category (weight / scales / biases).
+        Use 0 if the pattern has no category group (Mixtral case).
+    expert_group:
+        Regex group index for the expert index (if present in key).
+        ``None`` for Qwen-style where expert index is the first tensor dimension.
+
+    Raises
+    ------
+    ValueError
+        If *arch_name* is already registered.
+    """
+    for entry in _EXPERT_KEY_PARSERS:
+        if entry[-1] == arch_name:
+            raise ValueError(
+                f"Parser already registered for architecture: {arch_name!r}"
+            )
+    _EXPERT_KEY_PARSERS.append(
+        (regex, layer_group, proj_group, cat_group, expert_group, arch_name)
+    )
+
+
 def _get_dtype_bytes(dtype: str) -> int:
     """Return the byte width for a safetensors dtype string."""
     if dtype not in _DTYPE_BYTES:

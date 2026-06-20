@@ -141,6 +141,12 @@ def _streaming_switch_linear_call(
     slot_ids: List[int]
     stacked, slot_ids = slot_bank.resolve(unique_experts)
 
+    # Record routing for EMA prefetcher (Priority 2)
+    if routing_callback:
+        routing_callback(
+            getattr(slot_bank, "layer", 0), unique_experts
+        )
+
     # ── 3. Dispatch to quantised or float32 forward path ────────────
     # The sidecar stores per-expert weights as contiguous bytes.
     #   float32:   expert_i = [gate_bytes | up_bytes | down_bytes]
@@ -330,6 +336,7 @@ def patch_switch_linear(
     warm_slots: int = 64,
     transient_slots: int = 8,
     calibration_frequencies: Optional[Dict[int, float]] = None,
+    routing_callback: Optional[Callable[[int, List[int]], None]] = None,
 ) -> None:
     """Patch a ``SwitchGLU`` (or equivalent) module for expert streaming.
 
@@ -472,6 +479,7 @@ def apply_streaming_patches(
     warm_slots: int = 64,
     transient_slots: int = 8,
     calibration_frequencies: Optional[Dict[int, float]] = None,
+    routing_callback: Optional[Callable[[int, List[int]], None]] = None,
 ) -> None:
     """Apply streaming patches to all SwitchGLU layers in a model.
 

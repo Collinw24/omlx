@@ -88,10 +88,13 @@ from .config import StreamingConfig
 from .pipeline import (
     EMATrajectoryPrefetcher,
     load_model_with_streaming,
+    record_routing,
+    prefetch_step,
     resolve_sidecar_path,
     streaming_forward_pass,
     unload_streaming,
 )
+from .sidecar import register_parser
 
 __all__ = [
     "StreamingExpertSidecar",
@@ -107,4 +110,7 @@ __all__ = [
     "streaming_forward_pass",
     "unload_streaming",
     "EMATrajectoryPrefetcher",
+    "register_parser",
+    "record_routing",
+    "prefetch_step",
 ]

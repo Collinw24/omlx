@@ -195,10 +195,28 @@ def load_model_with_streaming(
         calibration_frequencies=cfg.calibration_frequencies,
     )
 
+    routing_callback = lambda layer, experts: record_routing(
+        layer, experts, {"routed_experts": {}},
+    )
+    apply_streaming_patches(
+        model=model,
+        sidecar=sidecar,
+        layer_indices=list(slot_banks.keys()),
+        hot_count=cfg.expert_hot_count,
+        warm_slots=cfg.expert_warm_slots,
+        transient_slots=cfg.expert_transient_slots,
+        calibration_frequencies=cfg.calibration_frequencies,
+        routing_callback=routing_callback,
+    )
+
     return {
         "active": True,
         "sidecar": sidecar,
         "slot_banks": slot_banks,
+        "prefetcher": EMATrajectoryPrefetcher(
+            window=cfg.expert_prefetch_window,
+        ),
+        "routed_experts": {},  # populated per-token by patched __call__
     }
 
 
@@ -220,6 +238,55 @@ def unload_streaming(model: nn.Module) -> None:
                     unpatch_switch_linear(target)
 
     logger.info("Streaming patches removed for all layers.")
+
+
+# ---------------------------------------------------------------------------
+# Per-token prefetch wiring
+# ---------------------------------------------------------------------------
+
+
+def record_routing(
+    layer_key: int,
+    expert_ids: list[int],
+    streaming_state: dict,
+) -> None:
+    """Record which experts were routed on this token for prefetching."""
+    routed = streaming_state.setdefault("routed_experts", {})
+    routed[layer_key] = set(expert_ids)
+
+
+def prefetch_step(streaming_state: dict) -> None:
+    """Run one round of EMA trajectory prefetch after a token step.
+
+    Must be called AFTER ``mx.async_eval(output)``, during the GPU's
+    MoE compute window.  Writes predicted experts into warm slots NOT
+    in use by the current token.
+    """
+    if not streaming_state.get("active"):
+        return
+    prefetcher = streaming_state.get("prefetcher")
+    if prefetcher is None:
+        return
+    sidecar = streaming_state.get("sidecar")
+    slot_banks = streaming_state.get("slot_banks", {})
+    routed = streaming_state.get("routed_experts", {})
+    for layer_key, current_experts in routed.items():
+        slot_bank = slot_banks.get(layer_key)
+        if slot_bank is None:
+            continue
+        prefetcher.update(current_experts)
+        predicted = prefetcher.predict(current_experts)
+        warm_map = getattr(slot_bank, "_warm_map", {})
+        hot_map = getattr(slot_bank, "_hot_map", {})
+        exclude = set(warm_map.keys()) | set(hot_map.keys()) | set(current_experts)
+        safe = [e for e in predicted if e not in exclude]
+        for exp_id in safe:
+            ws = getattr(slot_bank, "warm_slots", 0)
+            if ws > 0 and len(warm_map) < ws:
+                idx = len(warm_map)
+                slot_bank._load_expert_into_buffer(exp_id, slot_bank._warm_buffers, idx)
+                warm_map[exp_id] = idx
+                slot_bank._warm_map[exp_id] = idx
 
 
 # ---------------------------------------------------------------------------

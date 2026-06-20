@@ -759,3 +759,123 @@ class TestCorrectnessGate:
 
             finally:
                 sc.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# §7d — Full model correctness validation (Priority 1)
+# ═══════════════════════════════════════════════════════════════════════
+# These tests require a real model to be cached locally.
+# Skipped (skipif) when no model is found.
+
+class TestFullModel:
+    """Full model correctness validation (§7d).
+
+    Requires a locally cached Qwen3.6-35B-A3B-oQ4-mtp model.
+    Uses a 2-layer partial load to avoid GPU timeout.
+    """
+
+    MODEL = "Jundot/Qwen3.6-35B-A3B-oQ4-mtp"
+    pytestmark = pytest.mark.skipif(
+        not os.path.isdir(os.path.expanduser(
+            "~/.cache/huggingface/hub/models--"
+            "Jundot--Qwen3.6-35B-A3B-oQ4-mtp/snapshots"
+        ))
+        or not any(
+            f.endswith(".safetensors")
+            for f in os.listdir(os.path.expanduser(
+                "~/.cache/huggingface/hub/models--"
+                "Jundot--Qwen3.6-35B-A3B-oQ4-mtp/snapshots"
+            ))
+        ),
+        reason="Jundot/Qwen3.6-35B model not cached locally",
+    )
+
+    def test_layer0_correctness(self):
+        """Layer 0 streaming output must match unpatched baseline.
+
+        Loads the model, truncates to 2 layers, creates a quantised
+        sidecar, runs the patched forward pass, and compares against
+        the unpatched reference.  Quantised outputs must be within
+        atol=1e-4 of the float32 reference.
+        """
+        import mlx.core as mx
+        import mlx_lm
+        from omlx.streaming import (
+            StreamingConfig, create_sidecar,
+            load_model_with_streaming, unload_streaming,
+        )
+
+        model, tokenizer = mlx_lm.load(self.MODEL)
+        model.model.layers = model.model.layers[:2]
+        mx.eval(model)
+
+        # Build sidecar from model path
+        cache = _os.path.expanduser(
+            "~/.cache/huggingface/hub/models--"
+            "Jundot--Qwen3.6-35B-A3B-oQ4-mtp/snapshots"
+        )
+        snaps = sorted(_os.listdir(cache), reverse=True)
+        model_path = _os.path.join(cache, snaps[0])
+        sc_path = "/tmp/test_7d.streaming"
+        create_sidecar(model_path, sc_path, quant=4)
+
+        tokens = mx.array(tokenizer.encode("The Eiffel Tower is in"))[None, :]
+        ref_logits = model(tokens)
+        mx.eval(ref_logits)
+
+        # Reload and patch
+        model2, _ = mlx_lm.load(self.MODEL)
+        model2.model.layers = model2.model.layers[:2]
+        mx.eval(model2)
+
+        cfg = StreamingConfig(
+            stream_experts=True,
+            expert_sidecar_path=sc_path,
+            expert_hot_count=13,
+            expert_warm_slots=64,
+            expert_transient_slots=8,
+        )
+        load_model_with_streaming(model2, cfg)
+
+        stream_logits = model2(tokens)
+        mx.eval(stream_logits)
+
+        max_diff = mx.max(mx.abs(stream_logits - ref_logits)).item()
+        assert mx.allclose(
+            stream_logits, ref_logits, atol=1e-4
+        ).item(), (
+            f"Layer 0 diverged. Max diff: {max_diff:.4e}"
+        )
+        unload_streaming(model2)
+        _os.unlink(sc_path)
+
+    def test_gpu_memory_reduction(self):
+        """GPU memory must drop by >= 40% after weight reclamation."""
+        import mlx.core as mx
+        import mlx_lm
+        from omlx.streaming import (
+            StreamingConfig, load_model_with_streaming,
+            unload_streaming,
+        )
+
+        if not hasattr(mx.metal, "get_active_memory"):
+            pytest.skip("mx.metal.get_active_memory() unavailable")
+
+        model, _ = mlx_lm.load(self.MODEL)
+        model.model.layers = model.model.layers[:2]
+        mx.eval(model)
+
+        mem_before = mx.metal.get_active_memory()
+
+        cfg = StreamingConfig(
+            stream_experts=True,
+            expert_sidecar_path="/tmp/test_7d.streaming",
+        )
+        load_model_with_streaming(model, cfg)
+        mx.eval(model.parameters())
+
+        mem_after = mx.metal.get_active_memory()
+        ratio = mem_after / mem_before
+        print(f"  GPU mem: {mem_before/1e6:.0f} MB -> {mem_after/1e6:.0f} MB ({ratio:.1%})")
+        assert ratio < 0.6, f"Memory not reduced: {ratio:.1%}"
+        unload_streaming(model)
