@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict
 from typing import Any, Dict, List, Tuple
+from dataclasses import dataclass, asdict
 
 import mlx.core as mx
 from .sidecar import StreamingExpertSidecar
@@ -52,6 +53,54 @@ logger = logging.getLogger(__name__)
 # Default window=4 → α=0.4
 _EMA_ALPHA_BASE = 2.0
 
+@dataclass(frozen=True)
+class SlotBankMetrics:
+    """Immutable telemetry snapshot from a single resolve() call.
+
+    Returned by ``resolve_with_metrics()`` for admin/API consumption.
+    """
+
+    # Resolution counts
+    hot_hits: int = 0
+    warm_hits: int = 0
+    warm_promotions: int = 0
+    transient_hits: int = 0
+    cold_misses: int = 0
+    transient_overflows: int = 0
+
+    # Sizing info
+    experts_loaded: int = 0
+    experts_requested: int = 0
+
+    # Utilization snapshots (from tier state at call time)
+    hot_used: int = 0
+    warm_used: int = 0
+    transient_used: int = 0
+
+    # I/O budget (from slot bank config)
+    total_expert_bytes: int = 0
+
+    # Layer identity
+    layer: str | int = ""
+
+
+def _merge_metrics(a: SlotBankMetrics, b: SlotBankMetrics) -> SlotBankMetrics:
+    """Element-wise sum of two SlotBankMetrics instances."""
+    return SlotBankMetrics(
+        hot_hits=a.hot_hits + b.hot_hits,
+        warm_hits=a.warm_hits + b.warm_hits,
+        warm_promotions=a.warm_promotions + b.warm_promotions,
+        transient_hits=a.transient_hits + b.transient_hits,
+        cold_misses=a.cold_misses + b.cold_misses,
+        transient_overflows=a.transient_overflows + b.transient_overflows,
+        experts_loaded=a.experts_loaded + b.experts_loaded,
+        experts_requested=a.experts_requested + b.experts_requested,
+        hot_used=max(a.hot_used, b.hot_used),
+        warm_used=max(a.warm_used, b.warm_used),
+        transient_used=max(a.transient_used, b.transient_used),
+        total_expert_bytes=max(a.total_expert_bytes, b.total_expert_bytes),
+        layer=b.layer if a.layer != "" else b.layer,
+    )
 
 class ExpertSlotBank:
     """
@@ -118,6 +167,8 @@ class ExpertSlotBank:
         # Pre-allocate output stacking buffer: (max_experts, expert_bytes)
         # Reused across resolve() calls to avoid dynamic allocation.
         self._stack_buf: mx.array | None = None
+        # Metrics tracking state — collected per resolve() call.
+        self._total_expert_bytes = expert_bytes
 
     def _ensure_stack_buf(self, k: int) -> mx.array:
         """Ensure pre-allocated stacking buffer is large enough for K experts.
@@ -397,6 +448,89 @@ class ExpertSlotBank:
         flat = indices.flatten().tolist()
         unique = sorted(set(flat))
         return self.resolve(unique)
+    def resolve_with_metrics(self, expert_ids):
+        hot_used = len(self._hot_map)
+        warm_used = len(self._warm_map)
+        transient_used = len(self._transient_map)
+        hot_hits = 0
+        warm_hits = 0
+        warm_promotions = 0
+        transient_hits = 0
+        cold_misses = 0
+        K = len(expert_ids)
+        slot_ids = []
+        cold_count = 0
+        for exp_id in expert_ids:
+            if exp_id in self._hot_map:
+                slot_ids.append(self._hot_map[exp_id])
+                hot_hits += 1
+                self._update_ema(exp_id)
+                continue
+            if exp_id in self._warm_map:
+                warm_slot = self._warm_map[exp_id]
+                if len(self._hot_map) < self.hot_count and self.hot_count > 0:
+                    hot_slot = len(self._hot_map)
+                    self._load_expert_into_buffer(exp_id, self._hot_buffers, hot_slot)
+                    self._hot_map[exp_id] = hot_slot
+                    del self._warm_map[exp_id]
+                    slot_ids.append(hot_slot)
+                    warm_promotions += 1
+                else:
+                    self._warm_map.move_to_end(exp_id)
+                    slot_ids.append(warm_slot)
+                    warm_hits += 1
+                self._update_ema(exp_id)
+                continue
+            if exp_id in self._transient_map:
+                trans_slot = self._transient_map[exp_id]
+                if len(self._hot_map) < self.hot_count and self.hot_count > 0:
+                    hot_slot = len(self._hot_map)
+                    self._load_expert_into_buffer(exp_id, self._hot_buffers, hot_slot)
+                    self._hot_map[exp_id] = hot_slot
+                    del self._transient_map[exp_id]
+                    slot_ids.append(hot_slot)
+                    warm_promotions += 1
+                else:
+                    slot_ids.append(trans_slot)
+                    transient_hits += 1
+                self._update_ema(exp_id)
+                continue
+            cold_count += 1
+            cold_misses += 1
+            if cold_count > self.transient_slots:
+                cold_ids = [eid for eid in expert_ids if eid not in self._hot_map and eid not in self._warm_map and eid not in self._transient_map]
+                metrics = SlotBankMetrics(hot_hits=hot_hits, warm_hits=warm_hits, warm_promotions=warm_promotions, transient_hits=transient_hits, cold_misses=cold_misses, transient_overflows=1, experts_loaded=0, experts_requested=K, hot_used=hot_used, warm_used=warm_used, transient_used=transient_used, total_expert_bytes=self._total_expert_bytes, layer=self.layer)
+                raise RuntimeError("Too many cold experts ({0}) for transient slots ({1}). Missing IDs: {2}. Increase transient_slots or add more warm capacity.".format(cold_count, self.transient_slots, cold_ids))
+            use_transient = self.warm_slots == 0
+            if use_transient:
+                slot_idx = self._next_transient
+                self._next_transient = (self._next_transient + 1) % self.transient_slots
+                old_exp_id = self._transient_map.pop(slot_idx, None)
+                self._load_expert_into_buffer(exp_id, self._transient_buffers, slot_idx)
+                self._transient_map[exp_id] = slot_idx
+                slot_ids.append(self.hot_count + slot_idx)
+            elif len(self._hot_map) < self.hot_count and self.hot_count > 0:
+                hot_slot = len(self._hot_map)
+                self._load_expert_into_buffer(exp_id, self._hot_buffers, hot_slot)
+                self._hot_map[exp_id] = hot_slot
+                slot_ids.append(hot_slot)
+            else:
+                evict_lru_slot = None
+                if len(self._warm_map) >= self.warm_slots:
+                    evicted_id, evicted_slot = next(iter(self._warm_map.items()))
+                    del self._warm_map[evicted_id]
+                    evict_lru_slot = evicted_slot
+                slot_idx = evict_lru_slot if evict_lru_slot is not None else len(self._warm_map)
+                old_exp_id = self._transient_map.pop(slot_idx, None)
+                self._load_expert_into_buffer(exp_id, self._warm_buffers, slot_idx)
+                self._warm_map[exp_id] = slot_idx
+                slot_ids.append(self.hot_count + slot_idx)
+            self._update_ema(exp_id)
+        stacked = self._ensure_stack_buf(K)
+        for i, slot_id in enumerate(slot_ids):
+            stacked[i] = self._get_slot_view(slot_id)
+        metrics = SlotBankMetrics(hot_hits=hot_hits, warm_hits=warm_hits, warm_promotions=warm_promotions, transient_hits=transient_hits, cold_misses=cold_misses, transient_overflows=0, experts_loaded=cold_count, experts_requested=K, hot_used=hot_used, warm_used=warm_used, transient_used=transient_used, total_expert_bytes=self._total_expert_bytes, layer=self.layer)
+        return stacked, slot_ids, metrics
 
     def _get_slot_view(self, slot_id: int) -> mx.array:
         """Return a view into the tier buffer row for a given slot ID.
