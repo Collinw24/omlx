@@ -60,9 +60,9 @@ class StreamingConfig:
         return cls(
             stream_experts=d.get("stream_experts", False),
             expert_sidecar_path=d.get("expert_sidecar_path"),
-            expert_hot_count=d.get("expert_hot_count", 13),
-            expert_warm_slots=d.get("expert_warm_slots", 64),
-            expert_transient_slots=d.get("expert_transient_slots", 8),
+            expert_hot_count=d.get("expert_hot_count", 8),
+            expert_warm_slots=d.get("expert_warm_slots", 16),
+            expert_transient_slots=d.get("expert_transient_slots", 4),
             expert_prefetch=d.get("expert_prefetch", True),
             expert_prefetch_window=d.get("expert_prefetch_window", 4),
             expert_top_k_override=d.get("expert_top_k_override"),
