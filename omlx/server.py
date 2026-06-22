@@ -48,10 +48,10 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi import Request as FastAPIRequest
@@ -278,7 +278,7 @@ class ServerState:
     process_memory_enforcer: Optional[object] = None  # ProcessMemoryEnforcer
     responses_store: ResponseStore = field(default_factory=ResponseStore)
     oq_manager: Optional[object] = None  # OQManager
-    hf_uploader: Optional[object] = None  # HFUploader
+    slot_bank_metrics: Optional[Dict[str, object]] = None
 
 
 # Global server state instance
@@ -524,13 +524,31 @@ except ImportError:
 from .admin.auth import _RedirectToLogin
 from .admin.routes import router as admin_router
 from .admin.routes import set_admin_getters
+from .admin.routes import set_slot_bank_getters
 
 set_admin_getters(
     get_server_state,
     get_engine_pool,
     lambda: _server_state.settings_manager,
     lambda: _server_state.global_settings,
-)
+    )
+
+# Wire streaming slot-bank metrics for admin API
+def _get_slot_bank_metrics() -> Optional[dict]:
+    """Collect SlotBankMetrics from all loaded engines.
+
+    Returns a dict mapping layer identifiers to SlotBankMetrics (serialized as dicts).
+    """
+    if _server_state.slot_bank_metrics is None:
+        return None
+    result: Dict[str, dict] = {}
+    for layer_key, metrics in _server_state.slot_bank_metrics.items():
+        if metrics is None:
+            continue
+        result[str(layer_key)] = asdict(metrics)
+    return result if result else None
+
+set_slot_bank_getters(_get_slot_bank_metrics)
 app.include_router(admin_router)
 
 
