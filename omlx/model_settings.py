@@ -204,6 +204,15 @@ class ModelSettings:
     vlm_mtp_draft_block_size: Optional[int] = (
         None  # Tokens per draft round (None = mlx-vlm default)
     )
+    # SSD expert streaming (NVMe MoE weight offload). Inert when disabled.
+    stream_experts: bool = False
+    expert_sidecar_path: Optional[str] = None
+    expert_hot_count: int = 8
+    expert_warm_slots: int = 16
+    expert_transient_slots: int = 4
+    expert_prefetch: bool = True
+    expert_prefetch_window: int = 4
+    expert_top_k_override: Optional[int] = None
 
     # Model management flags
     is_pinned: bool = False
@@ -249,6 +258,23 @@ class ModelSettings:
                     raise ValueError(
                         f"vlm_mtp_enabled and {name} cannot both be True; "
                         "choose one speculative path per model"
+                    )
+        # Streaming cannot coexist with speculative-decoding paths that also
+        # reference expert weights (MTP/DFlash/specprefil/turboquant all patch
+        # the same forward path).  When stream_experts=True those paths are
+        # reclaimed by the SSD offload pipeline.
+        if self.stream_experts:
+            conflicts = [
+                ("dflash_enabled", self.dflash_enabled),
+                ("specprefill_enabled", self.specprefill_enabled),
+                ("mtp_enabled", self.mtp_enabled),
+                ("turboquant_kv_enabled", self.turboquant_kv_enabled),
+            ]
+            for name, value in conflicts:
+                if value:
+                    raise ValueError(
+                        f"stream_experts and {name} cannot both be True; "
+                        "choose one expert-weight path per model"
                     )
 
     def to_dict(self) -> dict:
