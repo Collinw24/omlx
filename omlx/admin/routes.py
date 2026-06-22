@@ -1132,7 +1132,7 @@ _get_global_settings = None
 _hf_downloader = None
 _ms_downloader = None
 _oq_manager = None
-_hf_uploader = None
+_get_slot_bank_getter = None
 
 
 def set_admin_getters(
@@ -1199,6 +1199,15 @@ def set_hf_uploader(uploader):
     """
     global _hf_uploader
     _hf_uploader = uploader
+
+def set_slot_bank_getters(getter):
+    """Set the getter function for accessing slot-bank metrics.
+
+    Args:
+        getter: Function that returns a mapping of layer_id -> SlotBankMetrics.
+    """
+    global _get_slot_bank_getter
+    _get_slot_bank_getter = getter
 
 
 # =============================================================================
@@ -6266,3 +6275,23 @@ async def remove_upload_task(task_id: str, is_admin: bool = Depends(require_admi
     if not success:
         raise HTTPException(status_code=404, detail="Task not found or still active")
     return {"success": True}
+@router.get("/api/streaming-metrics")
+async def get_streaming_metrics(is_admin: bool = Depends(require_admin)):
+    """Return slot-bank metrics aggregated across all loaded engines.
+
+    The getter is injected by ``set_slot_bank_getters`` during server init.
+    Returns an empty object when streaming is not active.
+    """
+    if _get_slot_bank_getter is None:
+        raise HTTPException(
+            status_code=503, detail="Streaming slot-bank not initialized"
+        )
+    try:
+        metrics_by_layer = _get_slot_bank_getter()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get streaming metrics: {e}"
+        )
+    if metrics_by_layer is None:
+        return {"streaming_metrics": {}}
+    return {"streaming_metrics": metrics_by_layer}
