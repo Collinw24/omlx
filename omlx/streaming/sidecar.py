@@ -385,7 +385,19 @@ def _build_layer_metadata(
         projections[proj] = proj_meta
         total_expert_bytes += proj_total
 
-    return {"projections": projections, "_expert_total_bytes": total_expert_bytes}
+    # Compute per-projection byte offsets for header (RQ-1).
+    proj_offsets: dict[str, dict] = {}
+    running_off = 0
+    for pn, pm in projections.items():
+        seg_bytes = sum(pm.get(f"{cat}_bytes", 0) for cat in _CATEGORY_ORDER)
+        proj_offsets[pn] = {"offset": running_off, "size": seg_bytes}
+        running_off += seg_bytes
+
+    return {
+        "projections": projections,
+        "_expert_total_bytes": total_expert_bytes,
+        "projection_offsets": proj_offsets,
+    }
 
 
 def _read_tensor_slice(
