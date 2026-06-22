@@ -48,6 +48,41 @@ from .scheduler import SchedulerConfig
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
+def _build_streaming_config(
+    model_settings: "ModelSettings | None",
+) -> "StreamingConfig | None":
+    """Build a StreamingConfig from ModelSettings, returning None when disabled.
+
+    Lazy-imports the streaming submodule to avoid unnecessary startup overhead
+    for users who don't enable SSD expert streaming.  When ``stream_experts``
+    is False (the default on both ModelSettings and StreamingConfig) the
+    entire pipeline is inert.
+
+    Args:
+        model_settings: The per-model settings dataclass (may be None).
+
+    Returns:
+        A configured ``StreamingConfig`` when streaming is enabled, else ``None``.
+    """
+    if model_settings is None or not getattr(model_settings, "stream_experts", False):
+        return None
+
+    from .streaming.config import StreamingConfig
+
+    return StreamingConfig(
+        stream_experts=True,
+        expert_sidecar_path=model_settings.expert_sidecar_path,
+        expert_hot_count=getattr(model_settings, "expert_hot_count", 8),
+        expert_warm_slots=getattr(model_settings, "expert_warm_slots", 16),
+        expert_transient_slots=getattr(model_settings, "expert_transient_slots", 4),
+        expert_prefetch=getattr(model_settings, "expert_prefetch", True),
+        expert_prefetch_window=getattr(
+            model_settings, "expert_prefetch_window", 4
+        ),
+        expert_top_k_override=getattr(
+            model_settings, "expert_top_k_override", None
+        ),
+    )
 
 
 @dataclass
@@ -1338,6 +1373,7 @@ class EnginePool:
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                         prefill_eviction_callback=prefill_eviction_callback,
+                        streaming_config=_build_streaming_config(model_settings),
                     )
 
             _is_dflash_engine = (
@@ -1382,6 +1418,7 @@ class EnginePool:
                             scheduler_config=self._scheduler_config,
                             model_settings=model_settings,
                             prefill_eviction_callback=prefill_eviction_callback,
+                            streaming_config=_build_streaming_config(model_settings),
                         )
                     try:
                         await engine.start()
@@ -1456,6 +1493,7 @@ class EnginePool:
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                         prefill_eviction_callback=prefill_eviction_callback,
+                        streaming_config=_build_streaming_config(model_settings),
                     )
                     try:
                         await engine.start()
