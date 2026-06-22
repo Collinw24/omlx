@@ -63,6 +63,8 @@ def _is_switch_glu(mod: nn.Module) -> bool:
 def _streaming_switch_linear_call(
     self: nn.Module,
     x: mx.array,
+    layer: int | str,
+    routing_callback: Optional[Callable[[int, List[int]], None]] = None,
     *args: Any,
     **kwargs: Any,
 ) -> mx.array:
@@ -74,13 +76,12 @@ def _streaming_switch_linear_call(
         The ``SwitchGLU`` (or equivalent) instance being patched.
     x : mx.array
         Input tensor of shape ``(B, S, H)``.
+    layer : int | str
+        Layer identifier used by the shared slot bank for sidecar header lookup.
+    routing_callback : callable((layer, expert_ids), optional)
+        Optional callback invoked after slot resolution for EMA prefetcher.
     *args, **kwargs :
         Forwarded to the original ``__call__`` when streaming is disabled.
-
-    Returns
-    -------
-    mx.array
-        MoE output of shape ``(B, S, H)``.
 
     Invariant I1
     ------------
@@ -176,31 +177,80 @@ def _streaming_switch_linear_call(
 
         if K == 1:
             # ── Single-expert fast path (Q1 optimization) ────────────
-            # Use ``quantized_matmul`` directly instead of ``gather_qmm``
-            # to avoid unnecessary Metal command buffer segments.
-            from .sidecar import _DEFAULT_ALIGNMENT
-
+            # Use mx.gather_qmm with rhs_indices=[0] for single expert —
+            # avoids multi-expert scatter but keeps quantized matmul.
             BS = x.shape[0] * x.shape[1]
             x_flat = x.reshape(BS, -1)
 
-            # Reconstruct float32 weights from stacked for single expert
+            qm = layer_meta.get("quant", {})
+            bits = qm.get("bits", 4)
+            group_size = qm.get("group_size", 64)
+            mode = qm.get("mode", "affine")
+
             proj_meta = layer_meta.get("experts", {}).get("0", {}).get("projections", {})
             gate_shape = proj_meta.get("gate_proj", {}).get("weight_shape", [])
+            B_s, S_s, H_dim = x.shape
             M = gate_shape[1] if len(gate_shape) >= 2 else 512
-            H_dim = gate_shape[2] if len(gate_shape) >= 3 else x.shape[-1]
+            H_dim = gate_shape[2] if len(gate_shape) >= 3 else H_dim
 
-            flat = stacked.flatten().astype(mx.float32)
-            flat = flat[:3 * M * H_dim].reshape(3, M, H_dim)
+            def _pkg(rows: int, cols: int) -> tuple[int, int, int]:
+                qw = rows * ((cols * bits + 31) // 32)
+                grp = (cols + group_size - 1) // group_size
+                return qw, rows * grp, rows * grp
 
-            gate = x_flat @ flat[0].T
-            up = x_flat @ flat[1].T
-            acts = mx.silu(gate) * up
-            out = acts @ flat[2].T
-            return out.reshape(x.shape[0], x.shape[1], H_dim)
+            qw_g, sc_g, bi_g = _pkg(M, H_dim)
+            qw_u, sc_u, bi_u = _pkg(M, H_dim)
+            qw_d, sc_d, bi_d = _pkg(H_dim, M)
+            GA = (qw_g + sc_g + bi_g) * 4
+            UB = (qw_u + sc_u + bi_u) * 4
 
-        # ── Multi-expert gather_qmm path ─────────────────────────────        #    up_qw(sc),   up_sc(sc),   up_bi(sc),
-        #    down_qw(sc), down_sc(sc), down_bi(sc)]
-        # where qw sizes differ for gate/up (M,H) vs down (H,M).
+            import numpy as _np
+            _mx.eval(stacked)
+            raw = _np.frombuffer(stacked.tobytes(), dtype=_np.uint8).reshape(1, -1)
+
+            def _extract(raw_2d: _np.ndarray, rows: int, qw_sz: int, sc_sz: int, bi_sz: int, byte_off: int) -> tuple[mx.array, mx.array, mx.array]:
+                seg = raw_2d[:, byte_off:byte_off + (qw_sz + sc_sz + bi_sz) * 4]
+                qw_np = seg[:, :qw_sz * 4].ravel().view(_np.uint32).reshape(1, rows, -1)
+                sc_np = seg[:, qw_sz*4:(qw_sz+sc_sz)*4].ravel().view(_np.float32).reshape(1, rows, -1)
+                bi_np = seg[:, (qw_sz+sc_sz)*4:(qw_sz+sc_sz+bi_sz)*4].ravel().view(_np.float32).reshape(1, rows, -1)
+                return mx.array(qw_np.squeeze(0)), mx.array(sc_np.squeeze(0)), mx.array(bi_np.squeeze(0))
+
+            _proj_off = layer_meta.get("projection_offsets", {})
+            gate_off = _proj_off.get("gate_proj", {}).get("offset", 0)
+            up_off = _proj_off.get("up_proj", {}).get("offset", None)
+            down_off = _proj_off.get("down_proj", {}).get("offset", None)
+            if up_off is None:
+                up_off = GA
+            if down_off is None:
+                down_off = GA + UB
+
+            qw_g, sc_g, bi_g = _extract(raw, M, qw_g, sc_g, bi_g, gate_off)
+            qw_u, sc_u, bi_u = _extract(raw, M, qw_u, sc_u, bi_u, up_off)
+            qw_d, sc_d, bi_d = _extract(raw, H_dim, qw_d, sc_d, bi_d, down_off)
+
+            # Single expert: rhs_indices=[0], shape collapses to (1, BS, M/H)
+            gate = mx.gather_qmm(
+                x_flat, qw_g, scales=sc_g, biases=bi_g,
+                rhs_indices=mx.array([0], dtype=mx.int32), transpose=True,
+                group_size=group_size, bits=bits, mode=mode,
+            )  # (1, BS, M)
+
+            up = mx.gather_qmm(
+                x_flat, qw_u, scales=sc_u, biases=bi_u,
+                rhs_indices=mx.array([0], dtype=mx.int32), transpose=True,
+                group_size=group_size, bits=bits, mode=mode,
+            )  # (1, BS, M)
+
+            acts = mx.silu(gate) * up  # (1, BS, M)
+            moe_out = mx.gather_qmm(
+                acts, qw_d, scales=sc_d, biases=bi_d,
+                rhs_indices=mx.array([0], dtype=mx.int32), transpose=True,
+                group_size=group_size, bits=bits, mode=mode,
+            )  # (1, BS, H)
+
+            return moe_out.reshape(B_s, S_s, H_dim)
+
+        # ── Multi-expert gather_qmm path ─────────────────────────────
 
         qm = layer_meta.get("quant", {})
         bits = qm.get("bits", 4)
@@ -228,10 +278,20 @@ def _streaming_switch_linear_call(
         qw_u, sc_u, bi_u = _pkg(M, H_dim)
         qw_d, sc_d, bi_d = _pkg(H_dim, M)
 
-        # Byte offsets into each expert's packed chunk
-        GA = (qw_g + sc_g + bi_g) * 4
-        UB = (qw_u + sc_u + bi_u) * 4
-        expert_bytes = GA + UB + (qw_d + sc_d + bi_d) * 4
+        # Use header projection_offsets for byte offsets (RQ-1: header-driven, not recomputed).
+        _proj_off = layer_meta.get("projection_offsets", {})
+        gate_off = _proj_off.get("gate_proj", {}).get("offset", 0)
+        up_off = _proj_off.get("up_proj", {}).get("offset", None)
+        down_off = _proj_off.get("down_proj", {}).get("offset", None)
+        expert_bytes = _proj_off.get("down_proj", {}).get("size", 0) + (down_off if down_off is not None else 0)
+
+        # Fallback GA/UB computation for sidecars without projection_offsets.
+        if up_off is None:
+            up_off = (qw_g + sc_g + bi_g) * 4
+        if down_off is None:
+            down_off = up_off + (qw_u + sc_u + bi_u) * 4
+        if expert_bytes == 0:
+            expert_bytes = (qw_d + sc_d + bi_d) * 4 + down_off
 
         # Ensure stacked is eval'd, then extract per-projection tensors
         # via numpy byte reinterpretation for the K unique experts.
@@ -248,9 +308,9 @@ def _streaming_switch_linear_call(
             bi_np = seg[:, (qw_sz+sc_sz)*4:(qw_sz+sc_sz+bi_sz)*4].ravel().view(_np.float32).reshape(K, rows, -1)
             return mx.array(qw_np), mx.array(sc_np), mx.array(bi_np)
 
-        qw_g, sc_g, bi_g = _extract(raw, M, qw_g, sc_g, bi_g, 0)
-        qw_u, sc_u, bi_u = _extract(raw, M, qw_u, sc_u, bi_u, GA)
-        qw_d, sc_d, bi_d = _extract(raw, H_dim, qw_d, sc_d, bi_d, GA + UB)
+        qw_g, sc_g, bi_g = _extract(raw, M, qw_g, sc_g, bi_g, gate_off)
+        qw_u, sc_u, bi_u = _extract(raw, M, qw_u, sc_u, bi_u, up_off)
+        qw_d, sc_d, bi_d = _extract(raw, H_dim, qw_d, sc_d, bi_d, down_off)
 
         # Build mapping: routing indices → stacked position (0..K-1)
         # unique_experts is already sorted.
@@ -415,7 +475,7 @@ def patch_switch_linear(
     # ── 1. Capture the original __call__ for fallback ─────────────────
     original_call = module.__call__
     module.__call__ = lambda *a, **k: _streaming_switch_linear_call(
-        module, *a, **k
+        module, a[0] if a else None, layer, routing_callback, *a[1:], **k
     )
     # Store reference for fallback path.
     module._omlx_original_call = original_call
