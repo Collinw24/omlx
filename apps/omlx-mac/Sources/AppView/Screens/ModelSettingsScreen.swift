@@ -1391,7 +1391,7 @@ private struct ExperimentalSection: View {
 
     private var turboquantMidPrefillHelp: String {
         String(localized: "settings.experimental.turboquant.mid_prefill.sub",
-               defaultValue: "When a full prefill chunk cannot fit, convert the growing KV cache once and continue prefill with TurboQuant. This adds a one-time pause and may slow the rest of prefill.",
+               defaultValue: "When a full prefill chunk cannot fit, convert the growing KV cache once and continue with TurboQuant. Requires this to be the only loaded model. Adds a one-time pause and may slow the rest of prefill.",
                comment: "Help text for converting the TurboQuant KV cache once under prefill memory pressure")
     }
 

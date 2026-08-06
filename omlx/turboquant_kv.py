@@ -48,18 +48,23 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "TURBOQUANT_CONVERSION_SLICE_TOKENS",
+    "TURBOQUANT_PREFILL_KEY_CHUNK_TOKENS",
+    "TURBOQUANT_PREFILL_QUERY_BLOCK_TOKENS",
     "TurboQuantConversionStats",
     "TurboQuantKVCache",
     "BatchTurboQuantKVCache",
     "convert_kv_cache_sliced",
-    "turboquant_mse_bytes_per_element",
     "estimate_turboquant_conversion_peak_bytes",
+    "estimate_turboquant_prefill_attention_workspace_bytes",
+    "turboquant_mse_bytes_per_element",
     "turboquant_enabled",
 ]
 
 
 TURBOQUANT_CONVERSION_SLICE_TOKENS = 8192
 _CONVERSION_WORKSPACE_ARRAYS_PER_SOURCE = 4
+TURBOQUANT_PREFILL_QUERY_BLOCK_TOKENS = 256
+TURBOQUANT_PREFILL_KEY_CHUNK_TOKENS = 16384
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +125,88 @@ def turboquant_mse_bytes_per_element(head_dim: int, bits: float) -> float:
     key_vector_bytes = _quantized_mse_vector_bytes(head_dim, key_bits)
     value_vector_bytes = _quantized_mse_vector_bytes(head_dim, value_bits)
     return (key_vector_bytes + value_vector_bytes) / (2 * head_dim)
+
+def estimate_turboquant_prefill_attention_workspace_bytes(
+    *,
+    query_tokens: int,
+    kv_len: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    bits: float,
+    compute_dtype_size: float = 2,
+    causal: bool = True,
+) -> int:
+    """Bound the first chunked Q8-style TurboQuant prefill attention call.
+
+    The long-prefill route retains all completed query-block outputs while it
+    evaluates one 256-query by 16384-key block at a time. This structural
+    bound prices those retained outputs, the active score/softmax tensors,
+    unpack/cast/codebook tensors for K and V, packed state slices, and the
+    caller-owned query input. It does not rely on allocator fusion or on a
+    prior TurboQuant transient sample.
+    """
+    dimensions = (
+        query_tokens,
+        kv_len,
+        num_query_heads,
+        num_kv_heads,
+        head_dim,
+    )
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        for value in dimensions
+    ):
+        return 0
+    if (
+        not isinstance(bits, (int, float))
+        or isinstance(bits, bool)
+        or not math.isfinite(float(bits))
+        or float(bits) <= 0
+    ):
+        return 0
+    if (
+        not isinstance(compute_dtype_size, (int, float))
+        or isinstance(compute_dtype_size, bool)
+        or not math.isfinite(float(compute_dtype_size))
+        or float(compute_dtype_size) <= 0
+    ):
+        return 0
+
+    q_block = min(query_tokens, TURBOQUANT_PREFILL_QUERY_BLOCK_TOKENS)
+    k_block = min(kv_len, TURBOQUANT_PREFILL_KEY_CHUNK_TOKENS)
+    key_bits, value_bits = _turboquant_mse_bit_widths(float(bits))
+    key_words = (head_dim * key_bits + 31) // 32
+    value_words = (head_dim * value_bits + 31) // 32
+    compute_bytes = float(compute_dtype_size)
+
+    # Full-query buffers: caller input, scaled queries, final compute cast,
+    # retained float32 blocks, and the concatenated float32 result.
+    total = (3 * compute_bytes + 8) * num_query_heads * query_tokens * head_dim
+    # Nine active float32 query/value/accumulator stages.
+    total += 36 * num_query_heads * q_block * head_dim
+    # Dots, scaled scores, softmax subtraction, and weights.
+    total += 16 * num_query_heads * q_block * k_block
+    # K and V uint32 unpack, int32 cast, and float32 codebook-take tensors.
+    total += 24 * num_kv_heads * k_block * head_dim
+    # K/V norm casts plus packed state-slice materialization.
+    total += 8 * num_kv_heads * k_block
+    total += (
+        num_kv_heads
+        * k_block
+        * (4 * (key_words + value_words) + 4)
+    )
+    # Per-query max/denominator and online-softmax state.
+    total += 48 * num_query_heads * q_block
+
+    if causal:
+        # One additional masked score result, the causal bool tile, and its
+        # query/key index vectors.
+        total += 4 * num_query_heads * q_block * k_block
+        total += q_block * k_block
+        total += 8 * (q_block + k_block)
+
+    return int(math.ceil(total))
 
 
 def _quantized_state_shape_bytes(
@@ -718,7 +805,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         N: int,
         return_array: bool = False,
         window_size: int | None = None,
-    ):
+    ) -> str | mx.array | None:
         offset = self.offset
         if isinstance(offset, int):
             return create_attention_mask(N, offset, return_array, window_size)

@@ -5035,10 +5035,7 @@ class TestBatchGeneratorAllTokens:
         assert isinstance(inserted_cache, TurboQuantKVCache)
         assert state.cache[0] is inserted_cache
         materialize.assert_called_once_with(state.cache)
-        assert sync_clear.call_args_list == [
-            call(scheduler._stream),  # guarded conversion cleanup
-            call(scheduler._stream),  # restored-prefix materialization
-        ]
+        sync_clear.assert_called_once_with(scheduler._stream)
         assert scheduled == [request]
 
     def test_chunked_prefill_converts_after_sized_arrays_restore(
@@ -5100,10 +5097,7 @@ class TestBatchGeneratorAllTokens:
         assert isinstance(inserted_cache[1], TurboQuantKVCache)
         assert state.cache[1] is inserted_cache[1]
         materialize.assert_called_once_with(state.cache)
-        assert sync_clear.call_args_list == [
-            call(scheduler._stream),  # guarded conversion cleanup
-            call(scheduler._stream),  # restored-prefix materialization
-        ]
+        sync_clear.assert_called_once_with(scheduler._stream)
         assert scheduled == [request]
 
 
