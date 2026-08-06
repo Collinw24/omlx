@@ -12586,10 +12586,10 @@ class Scheduler:
             # happy path here is ``has_model_info() is True``; this
             # else branch only fires for skeletal test fixtures.
             if self.memory_monitor is not None and self.memory_monitor.has_model_info():
-                # ``estimate_block_memory(1)`` returns all-layers K+V
-                # bytes for a single token at the dtype the monitor was
-                # configured with — exactly the per-token cost the
-                # queue cap needs to weigh.
+                # ``estimate_block_memory(1)`` returns full-attention
+                # KVCache-layer K+V bytes for one token at the dtype the
+                # monitor was configured with. Non-sliceable recurrent and
+                # rotating states are not duplicated in each SSD block.
                 expected_kv_bytes_per_token = self.memory_monitor.estimate_block_memory(
                     1
                 )
