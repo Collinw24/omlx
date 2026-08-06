@@ -28,6 +28,7 @@ import omlx.scheduler as scheduler_module
 from omlx.cache.stats import PrefixCacheStats
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import (
+    PrefillEvictionRequest,
     Scheduler,
     SchedulerConfig,
     SchedulerOutput,
@@ -37,7 +38,6 @@ from omlx.scheduler import (
     _StoreCacheGate,
     _VLMMTPDecodeState,
 )
-
 
 class _ParserStopFactory:
     kind = "test"
@@ -235,6 +235,97 @@ class TestSchedulerStepOutputs:
         assert output.outputs == [prefill_error, decode_output]
         assert output.finished_request_ids == {"running"}
         scheduler._cleanup_finished.assert_called_once_with({"running"})
+
+    def test_chunked_eviction_is_delivered_before_waiting_admission(
+        self,
+        mock_model: MagicMock,
+        mock_tokenizer: MagicMock,
+    ) -> None:
+        """A waiting candidate cannot overwrite a chunked-prefill eviction."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.memory_monitor = None
+
+        chunked_request = Request(
+            request_id="chunked-first",
+            prompt=[1, 2, 3, 4],
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        waiting_request = Request(
+            request_id="waiting-second",
+            prompt=[5, 6],
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        scheduler.prefilling = deque([chunked_request])
+
+        first_eviction = PrefillEvictionRequest(
+            request_id=chunked_request.request_id,
+            model_id="model",
+            current_bytes=10,
+            target_cap_bytes=8,
+            predicted_transient_bytes=4,
+            requested_tokens=4,
+            reason="turboquant_mid_prefill",
+        )
+        second_eviction = PrefillEvictionRequest(
+            request_id=waiting_request.request_id,
+            model_id="model",
+            current_bytes=10,
+            target_cap_bytes=8,
+            predicted_transient_bytes=2,
+            requested_tokens=2,
+            reason="prefill_preflight",
+        )
+        chunked_rejection = RequestOutput(
+            request_id="chunked-rejected",
+            finished=True,
+            finish_reason="error",
+            error="rejected",
+        )
+        decode_output = RequestOutput(
+            request_id="running",
+            new_token_ids=[7],
+            new_text="x",
+        )
+
+        def _advance(
+            scheduled: list[Request],
+            rejected: list[RequestOutput],
+        ) -> None:
+            scheduler.prefilling.clear()
+            scheduled.append(chunked_request)
+            rejected.append(chunked_rejection)
+            scheduler._pending_prefill_eviction_request = first_eviction
+
+        def _schedule() -> tuple[list[Request], list[RequestOutput]]:
+            if scheduler._pending_prefill_eviction_request is not None:
+                scheduler._pending_prefill_eviction_request = second_eviction
+                return [], []
+            return [waiting_request], []
+
+        scheduler._advance_chunked_prefills = MagicMock(side_effect=_advance)
+        scheduler._schedule_waiting = MagicMock(side_effect=_schedule)
+        scheduler._process_batch_responses = MagicMock(
+            return_value=([decode_output], set())
+        )
+        scheduler.running = {"running": MagicMock()}
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.side_effect = [
+            iter([MagicMock()]),
+            iter([]),
+        ]
+
+        first_output = scheduler.step()
+
+        assert first_output.prefill_eviction_request is first_eviction
+        assert first_output.scheduled_request_ids == [chunked_request.request_id]
+        assert first_output.outputs == [chunked_rejection, decode_output]
+        scheduler._schedule_waiting.assert_not_called()
+
+        second_output = scheduler.step()
+
+        assert second_output.prefill_eviction_request is None
+        assert second_output.scheduled_request_ids == [waiting_request.request_id]
+        scheduler._schedule_waiting.assert_called_once_with()
 
 
 class TestSchedulerInitialization:
@@ -4736,7 +4827,10 @@ class TestBatchGeneratorAllTokens:
         assert isinstance(inserted_cache, TurboQuantKVCache)
         assert state.cache[0] is inserted_cache
         materialize.assert_called_once_with(state.cache)
-        sync_clear.assert_called_once_with(scheduler._stream)
+        assert sync_clear.call_args_list == [
+            call(scheduler._stream),  # guarded conversion cleanup
+            call(scheduler._stream),  # restored-prefix materialization
+        ]
         assert scheduled == [request]
 
     def test_chunked_prefill_converts_after_sized_arrays_restore(
@@ -4798,7 +4892,10 @@ class TestBatchGeneratorAllTokens:
         assert isinstance(inserted_cache[1], TurboQuantKVCache)
         assert state.cache[1] is inserted_cache[1]
         materialize.assert_called_once_with(state.cache)
-        sync_clear.assert_called_once_with(scheduler._stream)
+        assert sync_clear.call_args_list == [
+            call(scheduler._stream),  # guarded conversion cleanup
+            call(scheduler._stream),  # restored-prefix materialization
+        ]
         assert scheduled == [request]
 
 
