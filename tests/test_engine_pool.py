@@ -1204,6 +1204,36 @@ class TestEnginePoolAsync:
         assert pool._engine_runtime_signature("model-a", dflash) != pure_signature
         assert pool._engine_runtime_signature("model-a", vlm_mtp) != pure_signature
 
+    def test_turboquant_mid_prefill_only_affects_active_signature(
+        self, pool_with_mock_engines: EnginePool
+    ) -> None:
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        off_false = ModelSettings(
+            turboquant_kv_enabled=False,
+            turboquant_mid_prefill=False,
+        )
+        off_true = ModelSettings(
+            turboquant_kv_enabled=False,
+            turboquant_mid_prefill=True,
+        )
+        on_false = ModelSettings(
+            turboquant_kv_enabled=True,
+            turboquant_mid_prefill=False,
+        )
+        on_true = ModelSettings(
+            turboquant_kv_enabled=True,
+            turboquant_mid_prefill=True,
+        )
+
+        assert pool._engine_runtime_signature(
+            "model-a", off_false
+        ) == pool._engine_runtime_signature("model-a", off_true)
+        assert pool._engine_runtime_signature(
+            "model-a", on_false
+        ) != pool._engine_runtime_signature("model-a", on_true)
+
     @pytest.mark.asyncio
     async def test_base_request_reloads_after_profile_variant(
         self, pool_with_mock_engines

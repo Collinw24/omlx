@@ -546,6 +546,7 @@ class EngineCore:
         specprefill_system_end: Optional[int] = None,
         skip_cache_store: bool = False,
         tools: list[dict[str, Any]] | None = None,
+        prefill_eviction_callback_attempted: bool = False,
     ) -> str:
         """
         Add a request for processing.
@@ -562,6 +563,8 @@ class EngineCore:
             specprefill: Per-request SpecPrefill override (True/False/None)
             specprefill_keep_pct: Per-request keep rate override
             specprefill_threshold: Per-request threshold override (min tokens)
+            prefill_eviction_callback_attempted: Whether route preflight already
+                invoked the async LRU callback for this request.
 
         Returns:
             The request ID
@@ -585,6 +588,7 @@ class EngineCore:
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=skip_cache_store,
+            prefill_eviction_retries=int(prefill_eviction_callback_attempted),
         )
 
         # SpecPrefill: resolve per-request settings.

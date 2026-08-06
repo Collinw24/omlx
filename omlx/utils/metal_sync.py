@@ -16,6 +16,8 @@ given, resolved on the calling thread.
 """
 
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import mlx.core as mx
 from mlx_lm.generate import generation_stream
@@ -31,6 +33,132 @@ _default_generation_stream = generation_stream
 # inference thread concurrently issues a reclaim-triggering mx op.
 # See: https://github.com/jundot/omlx/issues/1106
 _mx_buffer_access_lock = threading.RLock()
+
+
+class _ConversionCoordinator:
+    """Process-wide reader/writer gate and conversion peak reservation.
+
+    Prefill forward/eval regions participate as shared readers. A waiting
+    conversion prevents later readers from entering, drains active readers,
+    and then owns the exclusive gate until conversion cleanup completes.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition(threading.Lock())
+        self._active_prefills = 0
+        self._waiting_conversions = 0
+        self._conversion_owner: object | None = None
+        self._reservation_owner: object | None = None
+        self._outstanding_bytes = 0
+
+    @contextmanager
+    def prefill_memory_operation(self) -> Iterator[None]:
+        """Join a concurrent prefill memory operation."""
+        with self._condition:
+            while self._conversion_owner is not None or self._waiting_conversions > 0:
+                self._condition.wait()
+            self._active_prefills += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active_prefills -= 1
+                if self._active_prefills == 0:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def conversion(self) -> Iterator[object]:
+        """Own exclusive conversion admission until the context exits."""
+        owner = object()
+        acquired = False
+        with self._condition:
+            self._waiting_conversions += 1
+            self._condition.notify_all()
+            try:
+                while self._conversion_owner is not None or self._active_prefills > 0:
+                    self._condition.wait()
+                self._conversion_owner = owner
+                acquired = True
+            finally:
+                self._waiting_conversions -= 1
+                if not acquired:
+                    self._condition.notify_all()
+        try:
+            yield owner
+        finally:
+            with self._condition:
+                if self._reservation_owner is owner:
+                    self._reservation_owner = None
+                    self._outstanding_bytes = 0
+                if self._conversion_owner is not owner:
+                    raise RuntimeError("TurboQuant conversion gate ownership was lost")
+                self._conversion_owner = None
+                self._condition.notify_all()
+
+    def try_reserve(
+        self,
+        owner: object,
+        *,
+        current_bytes: int,
+        peak_bytes: int,
+        limit_bytes: int,
+    ) -> tuple[bool, int]:
+        """Atomically check headroom and publish an accepted conversion peak."""
+        if current_bytes < 0 or peak_bytes < 0 or limit_bytes < 0:
+            raise ValueError("conversion memory values must be non-negative")
+        with self._condition:
+            if self._conversion_owner is not owner:
+                raise RuntimeError(
+                    "conversion reservation requires exclusive ownership"
+                )
+            if (
+                self._reservation_owner is not None
+                and self._reservation_owner is not owner
+            ):
+                raise RuntimeError("another conversion reservation is active")
+            prior_outstanding = (
+                0 if self._reservation_owner is owner else self._outstanding_bytes
+            )
+            estimated_bytes = current_bytes + prior_outstanding + peak_bytes
+            if limit_bytes > 0 and estimated_bytes > limit_bytes:
+                return False, estimated_bytes
+            self._reservation_owner = owner
+            self._outstanding_bytes = peak_bytes
+            self._condition.notify_all()
+            return True, estimated_bytes
+
+    def release_reservation(self, owner: object) -> None:
+        """Release the holder's peak before its post-conversion sample."""
+        with self._condition:
+            if self._conversion_owner is not owner:
+                raise RuntimeError("conversion reservation owner is not active")
+            if self._reservation_owner is None:
+                return
+            if self._reservation_owner is not owner:
+                raise RuntimeError("conversion reservation ownership was lost")
+            self._reservation_owner = None
+            self._outstanding_bytes = 0
+            self._condition.notify_all()
+
+    def outstanding_bytes(self, *, exclude_owner: object | None = None) -> int:
+        """Return bytes reserved by another conversion holder."""
+        with self._condition:
+            if self._reservation_owner is exclude_owner:
+                return 0
+            return self._outstanding_bytes
+
+    def snapshot(self) -> tuple[int, int, bool, int]:
+        """Return reader, waiting-writer, active-writer, and reservation state."""
+        with self._condition:
+            return (
+                self._active_prefills,
+                self._waiting_conversions,
+                self._conversion_owner is not None,
+                self._outstanding_bytes,
+            )
+
+
+_conversion_coordinator = _ConversionCoordinator()
 
 
 def _sync_and_clear_cache(stream=None):

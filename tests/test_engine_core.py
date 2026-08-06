@@ -340,6 +340,43 @@ class TestEngineCoreAddRequest:
                 engine.close()
 
     @pytest.mark.asyncio
+    async def test_route_preflight_attempt_consumes_scheduler_retry_budget(
+        self,
+        mock_model: MagicMock,
+        mock_tokenizer: MagicMock,
+    ) -> None:
+        """Later scheduler pressure cannot run a second LRU callback phase."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            engine.scheduler.add_request = MagicMock()
+
+            try:
+                request_id = await engine.add_request(
+                    prompt=[1, 2, 3],
+                    request_id="route-prefill-attempt",
+                    prefill_eviction_callback_attempted=True,
+                )
+                admitted_request = engine.scheduler.add_request.call_args.args[0]
+
+                assert admitted_request.prefill_eviction_retries == 1
+
+                engine.scheduler.requests[request_id] = admitted_request
+                engine.scheduler._prefill_eviction_callback_configured = True
+                engine.scheduler._raise_prefill_eviction_if_available(
+                    request_id=request_id,
+                    current=100,
+                    target_cap=80,
+                    predicted_transient=40,
+                    requested_tokens=3,
+                    reason="turboquant_mid_prefill",
+                )
+
+                assert admitted_request.prefill_eviction_retries == 1
+            finally:
+                engine.close()
+
+    @pytest.mark.asyncio
     async def test_add_request_creates_collector(self, mock_model, mock_tokenizer):
         """Test add_request() creates output collector."""
         with patch("omlx.engine_core.get_registry") as mock_registry:

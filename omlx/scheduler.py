@@ -17,9 +17,11 @@ import gc
 import importlib
 import inspect
 import logging
+import math
 import os
 import threading
 import time
+import traceback
 from array import array
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
@@ -69,10 +71,18 @@ from .speculative.vlm_mtp import (
     run_vlm_mtp_decode,
     vlm_mtp_positioned_sampling_available,
 )
+from .turboquant_kv import (
+    TURBOQUANT_CONVERSION_SLICE_TOKENS,
+    TurboQuantConversionStats,
+    convert_kv_cache_sliced,
+    estimate_turboquant_conversion_peak_bytes,
+    turboquant_mse_bytes_per_element,
+)
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.generation_config import load_generation_config_token_ids
 from .utils.hardware import format_bytes
 from .utils.metal_sync import (
+    _conversion_coordinator,
     _default_generation_stream,
     _mx_buffer_access_lock,
     _sync_and_clear_cache,
@@ -410,6 +420,70 @@ class _PrefillAbortedError(Exception):
         )
 
 
+def _format_and_detach_exception(exc: BaseException) -> str:
+    """Format an exception, then remove every traceback/frame reference."""
+    formatted = "".join(
+        traceback.format_exception(type(exc), exc, exc.__traceback__)
+    ).rstrip()
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        next_exception = current.__cause__ or current.__context__
+        current_traceback = current.__traceback__
+        current.__traceback__ = None
+        current.__cause__ = None
+        current.__context__ = None
+        if current_traceback is not None:
+            traceback.clear_frames(current_traceback)
+        current = next_exception
+    return formatted
+
+
+class _PrefillKVPhase(Enum):
+    """Resident full-attention KV representation during prefill."""
+
+    DENSE = "dense"
+    TURBOQUANT = "turboquant"
+    UNSUPPORTED = "unsupported"
+    INVALID_PARTIAL = "invalid_partial"
+
+
+@dataclass
+class _PrefillContext:
+    """Request-scoped phase and telemetry for one prefill."""
+
+    request_id: str
+    loop_label: str
+    phase: _PrefillKVPhase
+    conversion_eligible: bool
+    started_at: float | None = None
+    conversion_attempted: bool = False
+    mid_triggered: bool = False
+    trigger_tokens: int | None = None
+    conversion_seconds: float = 0.0
+    converted_layers: int = 0
+    conversion_slices: int = 0
+    skipped_dense_layers: int = 0
+    memory_before_bytes: int = 0
+    memory_after_bytes: int = 0
+    post_trigger_tokens: int = 0
+    conversion_completed_at: float | None = None
+    summary_logged: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _GuardedTurboQuantConversion:
+    """Successful conversion samples and telemetry."""
+
+    stats: TurboQuantConversionStats
+    before_bytes: int
+    after_bytes: int
+    estimated_peak_bytes: int
+    conversion_seconds: float
+    completed_at: float
+
+
 @dataclass
 class PrefillEvictionRequest:
     """Internal request for async LRU model eviction before prefill."""
@@ -484,6 +558,7 @@ class _PrefillState:
     boundary_enabled: bool  # Whether boundary snapshots are active
     block_size: int  # Copied from config.paged_cache_block_size
     total_length: int  # len(original tokens) for completeness
+    prefill_context: _PrefillContext | None = None
     # Pre-built insert-time params (set by _schedule_waiting before enqueuing)
     sampler: Any = None
     sm: Any = None
@@ -1670,6 +1745,9 @@ class Scheduler:
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
         self._turboquant_skip_last: bool = True
+        self._turboquant_mid_prefill: bool = False
+        self._prefill_dense_kv_dtype_size: float | None = None
+        self._prefill_tq_kv_dtype_size: float | None = None
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
         self._glm_dsa_adaptive_prefill = None
@@ -1817,6 +1895,10 @@ class Scheduler:
         # default level even while it ran an order of magnitude slower; one
         # line per request keeps that visible without a line per chunk.
         self._throttle_notified_requests: set[str] = set()
+        # Engine wrappers set this after construction. ``None`` keeps direct
+        # Scheduler users on the legacy one-shot path; ``False`` avoids a
+        # pointless pause when no async eviction callback exists.
+        self._prefill_eviction_callback_configured: bool | None = None
         self._pending_prefill_eviction_request: PrefillEvictionRequest | None = None
         self._memory_admission_blocked_request_id: str | None = None
         self._memory_admission_blocked_since: float = 0.0
@@ -1828,6 +1910,9 @@ class Scheduler:
         if config is not None and config.model_name:
             _tracker_model_id = config.model_name
         self._prefill_transient_tracker = PrefillTransientTracker(
+            model_id=_tracker_model_id
+        )
+        self._prefill_tq_transient_tracker = PrefillTransientTracker(
             model_id=_tracker_model_id
         )
         # One-shot probe of the GDN/Mamba fixed recurrent-state footprint,
@@ -3087,6 +3172,174 @@ class Scheduler:
 
         return bool(prompt_cache) and all(_ok(c) for c in prompt_cache)
 
+    def _classify_prefill_cache(
+        self, prompt_cache: list[Any]
+    ) -> tuple[_PrefillKVPhase, bool]:
+        """Classify only complete dense or complete configured-TQ cache states."""
+        raw_bits = getattr(self, "_turboquant_kv_bits", None)
+        if not isinstance(raw_bits, (int, float)) or isinstance(raw_bits, bool):
+            return _PrefillKVPhase.UNSUPPORTED, False
+        if not prompt_cache or not self._turboquant_eligible(prompt_cache):
+            return _PrefillKVPhase.UNSUPPORTED, False
+
+        family_indices = [
+            index
+            for index, cache_obj in enumerate(prompt_cache)
+            if _is_turboquant_kv_family_cache(cache_obj)
+        ]
+        if not family_indices:
+            return _PrefillKVPhase.UNSUPPORTED, False
+
+        skip_last = (
+            bool(getattr(self, "_turboquant_skip_last", True))
+            and len(family_indices) > 1
+        )
+        skipped_index = family_indices[-1] if skip_last else None
+        expected_tokens = _cache_layer_token_count(prompt_cache[family_indices[0]])
+        dense_targets = 0
+        turboquant_targets = 0
+        target_count = len(family_indices) - (1 if skipped_index is not None else 0)
+        expected_bits = float(raw_bits)
+
+        for index in family_indices:
+            cache_obj = prompt_cache[index]
+            if _cache_layer_token_count(cache_obj) != expected_tokens:
+                return _PrefillKVPhase.INVALID_PARTIAL, False
+            is_turboquant = _is_turboquant_kv_cache(cache_obj)
+            if index == skipped_index:
+                if is_turboquant or not isinstance(cache_obj, _MLXKVCache):
+                    return _PrefillKVPhase.INVALID_PARTIAL, False
+                continue
+            if is_turboquant:
+                cache_bits = getattr(cache_obj, "bits", None)
+                if not isinstance(cache_bits, (int, float)) or isinstance(
+                    cache_bits, bool
+                ):
+                    return _PrefillKVPhase.INVALID_PARTIAL, False
+                if not math.isclose(
+                    float(cache_bits), expected_bits, rel_tol=0.0, abs_tol=1e-6
+                ):
+                    return _PrefillKVPhase.INVALID_PARTIAL, False
+                turboquant_targets += 1
+            elif isinstance(cache_obj, _MLXKVCache):
+                dense_targets += 1
+            else:
+                return _PrefillKVPhase.INVALID_PARTIAL, False
+
+        if dense_targets == target_count and turboquant_targets == 0:
+            return _PrefillKVPhase.DENSE, True
+        if turboquant_targets == target_count and dense_targets == 0:
+            return _PrefillKVPhase.TURBOQUANT, False
+        return _PrefillKVPhase.INVALID_PARTIAL, False
+
+    def _discard_failed_prefill_cache(
+        self, request: "Request", prompt_cache: list[Any]
+    ) -> None:
+        """Drop every reference to a cache that may be partly converted."""
+        if getattr(request, "prompt_cache", None) is prompt_cache:
+            request.prompt_cache = None
+        prompt_cache.clear()
+        _sync_and_clear_cache(self._stream)
+
+    def _reclaim_failed_turboquant_conversion(
+        self,
+        request: "Request",
+        prompt_cache: list[Any],
+    ) -> None:
+        """Drop failed conversion state, collect it, then clear Metal buffers."""
+        if getattr(request, "prompt_cache", None) is prompt_cache:
+            request.prompt_cache = None
+        prompt_cache.clear()
+        try:
+            gc.collect()
+        except Exception as exc:
+            reclaim_traceback = _format_and_detach_exception(exc)
+            del exc
+            logger.error(
+                "TurboQuant failure GC failed for %s:\n%s",
+                request.request_id,
+                reclaim_traceback,
+            )
+        try:
+            _sync_and_clear_cache(self._stream)
+        except Exception as exc:
+            reclaim_traceback = _format_and_detach_exception(exc)
+            del exc
+            logger.error(
+                "TurboQuant failure Metal clear failed for %s:\n%s",
+                request.request_id,
+                reclaim_traceback,
+            )
+
+    def _new_prefill_context(
+        self,
+        request: "Request",
+        prompt_cache: list[Any],
+        *,
+        loop_label: str,
+    ) -> _PrefillContext:
+        """Create request-local phase state and reject partial caches."""
+        phase, conversion_eligible = self._classify_prefill_cache(prompt_cache)
+        if phase is _PrefillKVPhase.INVALID_PARTIAL:
+            current = self._current_usage_bytes()
+            limit = self._prefill_abort_cap() or None
+            self._discard_failed_prefill_cache(request, prompt_cache)
+            raise PrefillMemoryExceededError(
+                message=(
+                    "TurboQuant prefill cache was partially converted or used "
+                    "an incompatible bit width; the request cache was discarded"
+                ),
+                request_id=request.request_id,
+                estimated_bytes=current,
+                limit_bytes=limit,
+            )
+        started_at = request.prefill_started_at
+        telemetry_eligible = bool(
+            getattr(self, "_turboquant_mid_prefill", False)
+            and getattr(self, "_turboquant_kv_bits", None) is not None
+            and phase is _PrefillKVPhase.DENSE
+            and conversion_eligible
+        )
+        if telemetry_eligible and started_at is None:
+            started_at = time.perf_counter()
+            request.prefill_started_at = started_at
+        return _PrefillContext(
+            request_id=request.request_id,
+            loop_label=loop_label,
+            phase=phase,
+            conversion_eligible=conversion_eligible,
+            started_at=started_at,
+            conversion_attempted=request.turboquant_mid_prefill_attempted,
+        )
+
+    def _prefill_phase_dtype_size(self, phase: _PrefillKVPhase) -> float | None:
+        """Return the full-attention KV width for one complete cache phase."""
+        if phase is _PrefillKVPhase.TURBOQUANT:
+            width = getattr(self, "_prefill_tq_kv_dtype_size", None)
+        else:
+            width = getattr(self, "_prefill_dense_kv_dtype_size", None)
+        if isinstance(width, (int, float)) and not isinstance(width, bool):
+            return float(width)
+        return None
+
+    def _prefill_transient_tracker_for_phase(
+        self, phase: _PrefillKVPhase
+    ) -> PrefillTransientTracker | None:
+        """Return the history trained under the same resident KV width."""
+        if phase is _PrefillKVPhase.TURBOQUANT:
+            return getattr(self, "_prefill_tq_transient_tracker", None)
+        return getattr(self, "_prefill_transient_tracker", None)
+
+    def _raise_if_prefill_cancelled(
+        self, request_id: str, processed_tokens: int
+    ) -> None:
+        """Raise the existing prefill-abort signal at a conversion boundary."""
+        if request_id not in self._pending_abort_ids:
+            return
+        uid = self.request_id_to_uid.get(request_id)
+        aborted_uids = [uid] if uid is not None else []
+        raise _PrefillAbortedError(aborted_uids, processed_tokens)
+
     def _apply_turboquant_kv_empty(self, prompt_cache: list[Any]) -> None:
         """Replace empty KVCache layers with empty TurboQuantKVCache.
 
@@ -3129,47 +3382,360 @@ class Scheduler:
                 f"cache layers set to {bits}-bit{skip_msg}"
             )
 
-    def _apply_turboquant_kv_convert(self, prompt_cache: list[Any]) -> None:
-        """Convert populated KVCache data to TurboQuantKVCache via from_cache().
-
-        Called AFTER fp16 prefill completes (or on an SSD-restored fp16
-        cache): the completed full-precision KV is quantized once, so prefill
-        hidden states stay exact and quantization error only enters at
-        decode-time reads. This is the key difference from #717/#771, which
-        quantized on the fly during prefill and corrupted hidden states.
-        """
-        from mlx_lm.models.cache import CacheList, KVCache
-        from mlx_vlm.turboquant import TurboQuantKVCache
-
-        kv_indices = [
-            i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
-        ]
-        skip_last = self._turboquant_skip_last and len(kv_indices) > 1
-        last_kv_idx = kv_indices[-1] if skip_last else -1
-
-        converted = 0
-        bits = float(self._turboquant_kv_bits)
-        for i, cache_obj in enumerate(prompt_cache):
-            if isinstance(cache_obj, KVCache):
-                if i == last_kv_idx:
-                    continue
-                prompt_cache[i] = TurboQuantKVCache.from_cache(cache_obj, bits=bits)
-                converted += 1
-            elif isinstance(cache_obj, CacheList):
-                new_caches = []
-                for c in cache_obj.caches:
-                    if isinstance(c, KVCache):
-                        new_caches.append(TurboQuantKVCache.from_cache(c, bits=bits))
-                        converted += 1
-                    else:
-                        new_caches.append(c)
-                cache_obj.caches = tuple(new_caches)
-        if converted > 0:
-            skip_msg = ", skipped last KVCache layer" if skip_last else ""
-            logger.info(
-                f"TurboQuant: converted {converted}/{len(prompt_cache)} "
-                f"cache layers to {bits}-bit{skip_msg}"
+    def _apply_turboquant_kv_convert(
+        self,
+        prompt_cache: list[Any],
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+        log_result: bool = True,
+    ) -> TurboQuantConversionStats:
+        """Convert populated dense KV in bounded slices, one layer at a time."""
+        raw_bits = getattr(self, "_turboquant_kv_bits", None)
+        if not isinstance(raw_bits, (int, float)) or isinstance(raw_bits, bool):
+            raise ValueError("TurboQuant KV bit width is not configured")
+        stats = convert_kv_cache_sliced(
+            prompt_cache,
+            bits=float(raw_bits),
+            skip_last=bool(getattr(self, "_turboquant_skip_last", True)),
+            slice_tokens=TURBOQUANT_CONVERSION_SLICE_TOKENS,
+            stream=getattr(self, "_stream", None),
+            check_cancelled=check_cancelled,
+        )
+        if log_result and stats.converted_layers > 0:
+            skip_msg = (
+                ", skipped last KVCache layer" if stats.skipped_dense_layers > 0 else ""
             )
+            logger.info(
+                "TurboQuant: converted %d/%d cache layers to %s-bit%s",
+                stats.converted_layers,
+                len(prompt_cache),
+                float(raw_bits),
+                skip_msg,
+            )
+        return stats
+
+    def _run_guarded_turboquant_conversion(
+        self,
+        *,
+        request: "Request",
+        prompt_cache: list[Any],
+        processed_tokens: int,
+        safety_cap: int,
+        conversion_label: str,
+        log_result: bool,
+    ) -> _GuardedTurboQuantConversion:
+        """Reserve and run one conversion under the process-wide exclusive gate."""
+        result: _GuardedTurboQuantConversion | None = None
+        with (
+            _conversion_coordinator.conversion() as conversion_owner,
+            _mx_buffer_access_lock,
+        ):
+            before = self._current_usage_bytes()
+            conversion_peak = 0
+            estimate_traceback: str | None = None
+            try:
+                raw_bits = getattr(self, "_turboquant_kv_bits", None)
+                if not isinstance(raw_bits, (int, float)) or isinstance(raw_bits, bool):
+                    raise ValueError("TurboQuant KV bit width is not configured")
+                conversion_peak = estimate_turboquant_conversion_peak_bytes(
+                    prompt_cache,
+                    bits=float(raw_bits),
+                    skip_last=bool(getattr(self, "_turboquant_skip_last", True)),
+                    slice_tokens=TURBOQUANT_CONVERSION_SLICE_TOKENS,
+                )
+            except Exception as exc:
+                estimate_traceback = _format_and_detach_exception(exc)
+                del exc
+
+            if estimate_traceback is not None:
+                logger.error(
+                    "TurboQuant %s conversion estimate failed for %s:\n%s",
+                    conversion_label,
+                    request.request_id,
+                    estimate_traceback,
+                )
+                self._reclaim_failed_turboquant_conversion(
+                    request,
+                    prompt_cache,
+                )
+                raise PrefillMemoryExceededError(
+                    message=(
+                        f"TurboQuant {conversion_label} conversion could not "
+                        "be bounded; the request cache was discarded"
+                    ),
+                    request_id=request.request_id,
+                    estimated_bytes=before,
+                    limit_bytes=safety_cap or None,
+                ) from None
+
+            accepted, estimated_peak = _conversion_coordinator.try_reserve(
+                conversion_owner,
+                current_bytes=before,
+                peak_bytes=conversion_peak,
+                limit_bytes=safety_cap,
+            )
+            if not accepted:
+                self._reclaim_failed_turboquant_conversion(
+                    request,
+                    prompt_cache,
+                )
+                raise PrefillMemoryExceededError(
+                    message=(
+                        f"TurboQuant {conversion_label} conversion would "
+                        f"exceed the prefill safety cap at "
+                        f"{processed_tokens} tokens"
+                    ),
+                    request_id=request.request_id,
+                    estimated_bytes=int(estimated_peak),
+                    limit_bytes=int(safety_cap),
+                ) from None
+
+            if conversion_label == "mid-prefill":
+                logger.info(
+                    "TurboQuant mid-prefill trigger for %s at %d tokens "
+                    "(usage=%.3fGiB, conversion_peak=%.3fGiB, "
+                    "safety_cap=%.3fGiB)",
+                    request.request_id,
+                    processed_tokens,
+                    before / 1024**3,
+                    conversion_peak / 1024**3,
+                    safety_cap / 1024**3,
+                )
+
+            def _check_cancelled() -> None:
+                self._raise_if_prefill_cancelled(
+                    request.request_id,
+                    processed_tokens,
+                )
+
+            started = time.perf_counter()
+            stats: TurboQuantConversionStats | None = None
+            completed_at: float | None = None
+            after = before
+            failure_traceback: str | None = None
+            failure_message: str | None = None
+            aborted_uids: list[int] | None = None
+            aborted_tokens = processed_tokens
+            try:
+                stats = self._apply_turboquant_kv_convert(
+                    prompt_cache,
+                    check_cancelled=_check_cancelled,
+                    log_result=log_result,
+                )
+                completed_at = time.perf_counter()
+                converted_phase, _ = self._classify_prefill_cache(prompt_cache)
+                if converted_phase is not _PrefillKVPhase.TURBOQUANT:
+                    raise RuntimeError(
+                        f"conversion ended in incomplete cache phase "
+                        f"{converted_phase.value}"
+                    )
+                _sync_and_clear_cache(self._stream)
+                _conversion_coordinator.release_reservation(conversion_owner)
+                after = self._current_usage_bytes()
+                if safety_cap > 0 and after > safety_cap:
+                    failure_message = (
+                        f"TurboQuant {conversion_label} converted cache "
+                        "remained above the prefill safety cap"
+                    )
+            except _PrefillAbortedError as exc:
+                aborted_uids = list(exc.aborted_uids)
+                aborted_tokens = int(exc.processed_tokens)
+                _format_and_detach_exception(exc)
+                del exc
+            except Exception as exc:
+                failure_traceback = _format_and_detach_exception(exc)
+                failure_message = f"TurboQuant {conversion_label} conversion failed"
+                del exc
+
+            if aborted_uids is not None:
+                stats = None
+                completed_at = None
+                self._reclaim_failed_turboquant_conversion(
+                    request,
+                    prompt_cache,
+                )
+                raise _PrefillAbortedError(
+                    aborted_uids,
+                    aborted_tokens,
+                ) from None
+
+            if failure_message is not None:
+                if failure_traceback is not None:
+                    logger.error(
+                        "TurboQuant %s conversion failed for %s:\n%s",
+                        conversion_label,
+                        request.request_id,
+                        failure_traceback,
+                    )
+                stats = None
+                completed_at = None
+                self._reclaim_failed_turboquant_conversion(
+                    request,
+                    prompt_cache,
+                )
+                raise PrefillMemoryExceededError(
+                    message=(f"{failure_message}; the request cache was discarded"),
+                    request_id=request.request_id,
+                    estimated_bytes=int(estimated_peak),
+                    limit_bytes=safety_cap or None,
+                ) from None
+
+            if stats is None or completed_at is None:
+                raise RuntimeError("TurboQuant conversion produced no result")
+            result = _GuardedTurboQuantConversion(
+                stats=stats,
+                before_bytes=before,
+                after_bytes=after,
+                estimated_peak_bytes=int(estimated_peak),
+                conversion_seconds=completed_at - started,
+                completed_at=completed_at,
+            )
+
+        if result is None:
+            raise RuntimeError("TurboQuant conversion gate produced no result")
+        return result
+
+    def _attempt_mid_prefill_conversion(
+        self,
+        *,
+        request: "Request",
+        prompt_cache: list[Any],
+        context: _PrefillContext,
+        processed_tokens: int,
+        safety_cap: int,
+    ) -> None:
+        """Run the request's sole pressure conversion or fail the request."""
+        request.turboquant_mid_prefill_attempted = True
+        context.conversion_attempted = True
+        context.mid_triggered = True
+        context.trigger_tokens = processed_tokens
+        result = self._run_guarded_turboquant_conversion(
+            request=request,
+            prompt_cache=prompt_cache,
+            processed_tokens=processed_tokens,
+            safety_cap=safety_cap,
+            conversion_label="mid-prefill",
+            log_result=False,
+        )
+        context.phase = _PrefillKVPhase.TURBOQUANT
+        context.conversion_eligible = False
+        context.converted_layers = result.stats.converted_layers
+        context.conversion_slices = result.stats.slices
+        context.skipped_dense_layers = result.stats.skipped_dense_layers
+        context.memory_before_bytes = result.before_bytes
+        context.memory_after_bytes = result.after_bytes
+        context.conversion_seconds = result.conversion_seconds
+        context.conversion_completed_at = result.completed_at
+
+    def _mid_prefill_conversion_available(
+        self,
+        context: _PrefillContext | None,
+        prompt_cache: list[Any] | None,
+        request: "Request | None",
+    ) -> bool:
+        """Return whether this dense request still owns its one trigger."""
+        if context is None:
+            return False
+        return bool(
+            getattr(self, "_turboquant_mid_prefill", False)
+            and getattr(self, "_turboquant_kv_bits", None) is not None
+            and context.phase is _PrefillKVPhase.DENSE
+            and context.conversion_eligible
+            and not context.conversion_attempted
+            and request is not None
+            and not request.turboquant_mid_prefill_attempted
+            and (prompt_cache is None or bool(prompt_cache))
+        )
+
+    def _can_defer_mid_prefill_preflight(self, phase: _PrefillKVPhase) -> bool:
+        """Let the guarded converter decide an opt-in dense peak rejection."""
+        return bool(
+            getattr(self, "_turboquant_mid_prefill", False)
+            and getattr(self, "_turboquant_kv_bits", None) is not None
+            and getattr(self, "_prefill_tq_kv_dtype_size", None) is not None
+            and phase is _PrefillKVPhase.DENSE
+        )
+
+    def _finalize_turboquant_prefill_cache(
+        self,
+        request: "Request",
+        prompt_cache: list[Any],
+        *,
+        processed_tokens: int,
+        context: _PrefillContext | None = None,
+    ) -> TurboQuantConversionStats | None:
+        """Complete ordinary post-prefill conversion with typed fail-closed cleanup."""
+        if getattr(self, "_turboquant_kv_bits", None) is None:
+            return None
+        phase, _ = self._classify_prefill_cache(prompt_cache)
+        if phase is _PrefillKVPhase.UNSUPPORTED:
+            return None
+        if phase is _PrefillKVPhase.TURBOQUANT:
+            if context is not None:
+                context.phase = phase
+            return None
+        if phase is _PrefillKVPhase.INVALID_PARTIAL:
+            self._discard_failed_prefill_cache(request, prompt_cache)
+            raise PrefillMemoryExceededError(
+                message=(
+                    "TurboQuant prefill cache was partially converted; the "
+                    "request cache was discarded"
+                ),
+                request_id=request.request_id,
+                estimated_bytes=self._current_usage_bytes(),
+                limit_bytes=self._prefill_abort_cap() or None,
+            )
+
+        result = self._run_guarded_turboquant_conversion(
+            request=request,
+            prompt_cache=prompt_cache,
+            processed_tokens=processed_tokens,
+            safety_cap=self._prefill_abort_cap(),
+            conversion_label="post-prefill",
+            log_result=True,
+        )
+        if context is not None:
+            context.phase = _PrefillKVPhase.TURBOQUANT
+            context.conversion_eligible = False
+        return result.stats
+
+    def _log_mid_prefill_summary(self, context: _PrefillContext) -> None:
+        """Emit one completion record for an actual pressure conversion."""
+        if not context.mid_triggered or context.summary_logged:
+            return
+        context.summary_logged = True
+        completed_at = time.perf_counter()
+        total_wall = (
+            completed_at - context.started_at if context.started_at is not None else 0.0
+        )
+        post_trigger_wall = (
+            completed_at - context.conversion_completed_at
+            if context.conversion_completed_at is not None
+            else 0.0
+        )
+        throughput = (
+            context.post_trigger_tokens / post_trigger_wall
+            if post_trigger_wall > 0
+            else 0.0
+        )
+        logger.info(
+            "TurboQuant mid-prefill complete for %s "
+            "(trigger_tokens=%d, conversion_pause=%.3fs, "
+            "post_trigger_tokens=%d, post_trigger_prefill_tps=%.2f tok/s, "
+            "total_wall=%.3fs, memory_before=%.3fGiB, memory_after=%.3fGiB, "
+            "layers=%d, slices=%d, skipped_dense=%d)",
+            context.request_id,
+            context.trigger_tokens or 0,
+            context.conversion_seconds,
+            context.post_trigger_tokens,
+            throughput,
+            total_wall,
+            context.memory_before_bytes / 1024**3,
+            context.memory_after_bytes / 1024**3,
+            context.converted_layers,
+            context.conversion_slices,
+            context.skipped_dense_layers,
+        )
 
     def _do_external_prefill(
         self,
@@ -3213,7 +3779,11 @@ class Scheduler:
                 if existing_cache is None:
                     self._apply_turboquant_kv_empty(cache)
                 else:
-                    self._apply_turboquant_kv_convert(cache)
+                    self._finalize_turboquant_prefill_cache(
+                        request,
+                        cache,
+                        processed_tokens=0,
+                    )
             return cache, tokens
 
         # Create or reuse cache
@@ -3221,6 +3791,11 @@ class Scheduler:
             prompt_cache = existing_cache
         else:
             prompt_cache = make_prompt_cache(self.model)
+        prefill_context = self._new_prefill_context(
+            request,
+            prompt_cache,
+            loop_label="external",
+        )
 
         # Fresh TurboQuant requests run fp16 during the cold prefill loop and
         # are quantized once at the end. Restored TurboQuant prefix caches stay
@@ -3332,6 +3907,7 @@ class Scheduler:
                 request_id=request.request_id,
                 loop_label="external",
                 kv_len=base_size + processed_tokens,
+                prefill_context=prefill_context,
             )
 
             # Pre-chunk safety guard: NEVER submit a chunk whose predicted peak
@@ -3346,6 +3922,9 @@ class Scheduler:
                 progress=processed_tokens,
                 loop_label="external",
                 request_id=request.request_id,
+                request=request,
+                prompt_cache=prompt_cache,
+                prefill_context=prefill_context,
             )
 
             _throttle_pre = get_phys_footprint()
@@ -3359,7 +3938,10 @@ class Scheduler:
             # eval graph across two streams and adds a per-chunk cross-stream
             # fence, the synchronization pattern implicated in the #2197 and
             # #2183 engine hangs on macOS 26.
-            with mx.stream(self._stream):
+            with (
+                _conversion_coordinator.prefill_memory_operation(),
+                mx.stream(self._stream),
+            ):
                 model_kwargs: dict[str, Any] = {}
                 if embeds_array is not None and embeds_array.shape[1] > 0:
                     model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
@@ -3369,6 +3951,10 @@ class Scheduler:
                         )
                 if self._supports_skip_lm_head():
                     model_kwargs["skip_lm_head"] = True
+                measure_post_trigger = (
+                    prefill_context.mid_triggered
+                    and prefill_context.phase is _PrefillKVPhase.TURBOQUANT
+                )
                 self.model(
                     input_arr[:, :n_to_process],
                     cache=prompt_cache,
@@ -3389,7 +3975,10 @@ class Scheduler:
                 loop_label="external",
                 kv_len=base_size + processed_tokens,
                 requested_step=prefill_step_size,
+                phase=prefill_context.phase,
             )
+            if measure_post_trigger:
+                prefill_context.post_trigger_tokens += n_to_process
             self._maybe_record_fixed_state_bytes(prompt_cache)
             # Enforcer-requested hard-pressure drain. The flag's normal
             # consumption point is the end-of-step cleanup, but this loop
@@ -3539,14 +4128,17 @@ class Scheduler:
         # format is unchanged. _merge_caches() then builds a
         # BatchTurboQuantKVCache when this request is inserted. Gated to dense
         # KVCache models — chunked/rotating caches stay fp16.
-        if self._turboquant_kv_bits is not None and self._turboquant_eligible(
-            prompt_cache
-        ):
-            self._apply_turboquant_kv_convert(prompt_cache)
+        self._finalize_turboquant_prefill_cache(
+            request,
+            prompt_cache,
+            processed_tokens=processed_tokens,
+            context=prefill_context,
+        )
 
         if getattr(request, "cached_tokens", 0) > 0:
             with mx.stream(self._stream):
                 _materialize_cache_storage(prompt_cache)
+        self._log_mid_prefill_summary(prefill_context)
 
         return prompt_cache, last_token
 
@@ -3580,7 +4172,13 @@ class Scheduler:
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
 
-    def _predicted_chunk_transient(self, n_tokens: int, kv_len: int) -> float:
+    def _predicted_chunk_transient(
+        self,
+        n_tokens: int,
+        kv_len: int,
+        *,
+        phase: _PrefillKVPhase = _PrefillKVPhase.DENSE,
+    ) -> float:
         """Conservative predicted Metal peak growth for one prefill chunk.
 
         The per-chunk SDPA/MoE transient scales with ``query_len * kv_len``, so
@@ -3600,7 +4198,17 @@ class Scheduler:
         per_token = 0.0
         static_per_token = 0.0
         recent_reclaim = 0
-        tracker = self._prefill_transient_tracker
+        tracker_selector = getattr(
+            self,
+            "_prefill_transient_tracker_for_phase",
+            None,
+        )
+        if callable(tracker_selector):
+            tracker = tracker_selector(phase)
+        elif phase is _PrefillKVPhase.TURBOQUANT:
+            tracker = getattr(self, "_prefill_tq_transient_tracker", None)
+        else:
+            tracker = getattr(self, "_prefill_transient_tracker", None)
         if tracker is not None:
             if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
                 per_token = max(
@@ -3613,7 +4221,12 @@ class Scheduler:
             static = self.memory_monitor.estimate_chunk_transient_bytes(
                 n_tokens, kv_len + n_tokens
             )
-            static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
+            width_selector = getattr(self, "_prefill_phase_dtype_size", None)
+            dtype_size = width_selector(phase) if callable(width_selector) else None
+            static += self.memory_monitor.estimate_prompt_kv_bytes(
+                n_tokens,
+                dtype_size=dtype_size,
+            )
             static_per_token = float(static) / n_tokens
             per_token = max(per_token, static_per_token)
         base_prediction = per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
@@ -3623,7 +4236,13 @@ class Scheduler:
         )
         return max(base_prediction, reallocation_prediction)
 
-    def _admission_transient_bound(self, n_tokens: int, kv_len: int) -> float:
+    def _admission_transient_bound(
+        self,
+        n_tokens: int,
+        kv_len: int,
+        *,
+        phase: _PrefillKVPhase = _PrefillKVPhase.DENSE,
+    ) -> float:
         """Transient charge for admission and the guard's pass/abort gates.
 
         The largest FLOOR-SIZE chunk transient observed this session is a
@@ -3643,8 +4262,22 @@ class Scheduler:
         shrink arithmetic stay on ``_predicted_chunk_transient``; a flat
         size-invariant bound would zero out their proportional response.
         """
-        bound = self._predicted_chunk_transient(n_tokens, kv_len)
-        tracker = self._prefill_transient_tracker
+        bound = self._predicted_chunk_transient(
+            n_tokens,
+            kv_len,
+            phase=phase,
+        )
+        tracker_selector = getattr(
+            self,
+            "_prefill_transient_tracker_for_phase",
+            None,
+        )
+        if callable(tracker_selector):
+            tracker = tracker_selector(phase)
+        elif phase is _PrefillKVPhase.TURBOQUANT:
+            tracker = getattr(self, "_prefill_tq_transient_tracker", None)
+        else:
+            tracker = getattr(self, "_prefill_transient_tracker", None)
         if tracker is not None:
             bound = max(bound, float(tracker.observed_max_bytes))
         return bound
@@ -3735,6 +4368,8 @@ class Scheduler:
         request = self.requests.get(request_id)
         if request is None:
             return
+        if getattr(self, "_prefill_eviction_callback_configured", None) is False:
+            return
         max_retries = getattr(
             self,
             "_MAX_PREFILL_EVICTION_RETRIES",
@@ -3775,34 +4410,97 @@ class Scheduler:
         progress: int,
         loop_label: str,
         request_id: str | None = None,
+        request: "Request | None" = None,
+        prompt_cache: list[Any] | None = None,
+        prefill_context: _PrefillContext | None = None,
     ) -> int:
-        """Clamp/abort a prefill chunk so its predicted peak can never reach
-        the physical Metal cap (the uncatchable async OOM crash).
-
-        Returns a chunk size whose predicted peak fits under the margined cap
-        (possibly shrunk from ``n_tokens``). If even the minimum chunk would
-        not fit after a reclaim, raises a clean RuntimeError — the context is
-        genuinely too large for available memory. That message intentionally
-        does NOT contain "Memory limit exceeded", so ``_requeue_or_fail_prefill``
-        fails it fast with a clear error rather than looping a doomed retry.
-        """
+        """Return a chunk whose predicted peak stays below the physical cap."""
         base_cap, cap, margin = self._prefill_abort_description()
         if cap <= 0:
             return n_tokens
-        # Speed priority: no shrinking — the floor IS the full chunk, so the
-        # abort gate below charges the full-step transient and the shrink
-        # math degenerates to returning n_tokens unchanged.
         if self._prefill_speed_priority:
             min_chunk = n_tokens
         else:
             min_chunk = max(1, self._prefill_min_chunk_tokens)
+        phase = (
+            prefill_context.phase
+            if prefill_context is not None
+            else _PrefillKVPhase.DENSE
+        )
         current = self._current_usage_bytes()
-        if current + self._admission_transient_bound(n_tokens, kv_len) <= cap:
+        full_transient = self._admission_transient_bound(
+            n_tokens,
+            kv_len,
+            phase=phase,
+        )
+        if current + full_transient <= cap:
             return n_tokens
 
-        # Predicted to breach — reclaim transients and re-measure once.
+        # Full chunk pressure is real only after transient reclaim.
         current = self._reclaim_prefill_headroom()
-        min_transient = self._admission_transient_bound(min_chunk, kv_len)
+        if current + full_transient <= cap:
+            return n_tokens
+
+        request_obj = request
+        if request_obj is None and request_id is not None:
+            request_obj = getattr(self, "requests", {}).get(request_id)
+        conversion_available = getattr(
+            self,
+            "_mid_prefill_conversion_available",
+            None,
+        )
+        if callable(conversion_available) and conversion_available(
+            prefill_context,
+            prompt_cache,
+            request_obj,
+        ):
+            maybe_raise_eviction = getattr(
+                self, "_raise_prefill_eviction_if_available", None
+            )
+            if request_id is not None and callable(maybe_raise_eviction):
+                maybe_raise_eviction(
+                    request_id=request_id,
+                    current=current,
+                    target_cap=cap,
+                    predicted_transient=int(full_transient),
+                    requested_tokens=n_tokens,
+                    reason="turboquant_mid_prefill",
+                )
+            if (
+                request_obj is not None
+                and prompt_cache is not None
+                and prefill_context is not None
+            ):
+                self._attempt_mid_prefill_conversion(
+                    request=request_obj,
+                    prompt_cache=prompt_cache,
+                    context=prefill_context,
+                    processed_tokens=progress,
+                    safety_cap=cap,
+                )
+                resized = self._adaptive_chunk_size(
+                    n_tokens,
+                    request_id=request_id or prefill_context.request_id,
+                    loop_label=loop_label,
+                    kv_len=kv_len,
+                    prefill_context=prefill_context,
+                )
+                return self._guard_prefill_chunk(
+                    resized,
+                    kv_len=kv_len,
+                    progress=progress,
+                    loop_label=loop_label,
+                    request_id=request_id,
+                    request=request_obj,
+                    prompt_cache=prompt_cache,
+                    prefill_context=prefill_context,
+                )
+
+        min_transient = self._admission_transient_bound(
+            min_chunk,
+            kv_len,
+            phase=phase,
+        )
         if current + min_transient > cap:
             maybe_raise_eviction = getattr(
                 self, "_raise_prefill_eviction_if_available", None
@@ -3830,8 +4528,6 @@ class Scheduler:
             )
             binding_str, advice = describe_ceiling_binding(
                 static=self._memory_static_ceiling_bytes,
-                # See _preflight_safety_rejection: the abort limit this cap
-                # derives from is min(static, metal_cap) by design.
                 dynamic=(
                     0
                     if self._memory_abort_limit_bytes
@@ -3858,13 +4554,16 @@ class Scheduler:
                 limit_bytes=int(cap),
             )
 
-        # The floor fits — pick the largest chunk that still fits under the cap.
-        per_token = self._predicted_chunk_transient(n_tokens, kv_len) / n_tokens
+        per_token = (
+            self._predicted_chunk_transient(
+                n_tokens,
+                kv_len,
+                phase=phase,
+            )
+            / n_tokens
+        )
         safe_n = int((cap - current) / per_token) if per_token > 0 else n_tokens
         n_fit = max(min_chunk, min(n_tokens, safe_n))
-        # Same quantization as the adaptive throttle: an off-grid size here
-        # would reintroduce the near-miss buffers _snap_chunk_size exists to
-        # avoid.
         n_fit = self._snap_chunk_size(n_fit, n_tokens)
         if n_fit < n_tokens:
             logger.debug(
@@ -3914,6 +4613,7 @@ class Scheduler:
         request_id: str,
         loop_label: str,
         kv_len: int = 0,
+        prefill_context: _PrefillContext | None = None,
     ) -> int:
         """Size the next prefill chunk so its predicted peak stays under a
         safety margin below the hard cap.
@@ -3970,7 +4670,19 @@ class Scheduler:
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
         # measurement so it tracks growth with kv_len instead of lagging behind
         # a long-run average.
-        per_token = self._predicted_chunk_transient(requested, kv_len) / requested
+        phase = (
+            prefill_context.phase
+            if prefill_context is not None
+            else _PrefillKVPhase.DENSE
+        )
+        per_token = (
+            self._predicted_chunk_transient(
+                requested,
+                kv_len,
+                phase=phase,
+            )
+            / requested
+        )
         predictor = "measured" if per_token > 0 else "none"
 
         # Keep each chunk's predicted peak under the LOWER of the dynamic
@@ -4013,6 +4725,26 @@ class Scheduler:
                     requested_tokens=requested,
                     reason="adaptive_prefill_throttle",
                 )
+            conversion_available = getattr(
+                self,
+                "_mid_prefill_conversion_available",
+                None,
+            )
+            if (
+                callable(conversion_available)
+                and conversion_available(
+                    prefill_context,
+                    None,
+                    getattr(self, "requests", {}).get(request_id),
+                )
+                and abort_cap > 0
+                and current + per_token * requested > abort_cap
+            ):
+                # The one-shot LRU call above has had its chance. Preserve the
+                # full candidate so the physical-cap guard can trigger the
+                # request's sole conversion instead of hiding pressure behind
+                # a dense floor-size chunk.
+                return requested
             if self._prefill_speed_priority:
                 # Speed priority: never shrink. Idle-model eviction above
                 # still gets its chance to free memory; beyond that, the
@@ -4127,6 +4859,8 @@ class Scheduler:
         Scheduler steps run on the MLX executor thread, so they can refresh
         mx.get_active_memory() safely. Event-loop callers such as early
         preflight use the cached executor sample and phys_footprint instead.
+        Every caller also sees a process-wide conversion peak reservation;
+        the conversion holder releases its reservation before its post sample.
         """
         active = self._last_mlx_active_memory_bytes
         if refresh_mlx_active:
@@ -4138,7 +4872,7 @@ class Scheduler:
         else:
             hot_cache_bytes = Scheduler._hot_cache_cpu_bytes(self)
         phys = max(0, int(get_phys_footprint()) - hot_cache_bytes)
-        return max(active, phys)
+        return max(active, phys) + _conversion_coordinator.outstanding_bytes()
 
     def get_active_hot_cache_block_hashes(self) -> set[bytes]:
         """Return hot-cache block hashes owned by active in-flight requests."""
@@ -4345,6 +5079,7 @@ class Scheduler:
         loop_label: str,
         kv_len: int = 0,
         requested_step: int | None = None,
+        phase: _PrefillKVPhase = _PrefillKVPhase.DENSE,
     ) -> None:
         """Feed one chunk's measured transient into the EWMA tracker.
 
@@ -4418,9 +5153,20 @@ class Scheduler:
                 requested_step,
             )
             return
-        self._prefill_transient_tracker.update(
-            n_tokens, delta, floor_sample=n_tokens <= min_chunk
+        tracker_selector = getattr(
+            self,
+            "_prefill_transient_tracker_for_phase",
+            None,
         )
+        if callable(tracker_selector):
+            tracker = tracker_selector(phase)
+        elif phase is _PrefillKVPhase.TURBOQUANT:
+            tracker = getattr(self, "_prefill_tq_transient_tracker", None)
+        else:
+            tracker = getattr(self, "_prefill_transient_tracker", None)
+        if tracker is None:
+            return
+        tracker.update(n_tokens, delta, floor_sample=n_tokens <= min_chunk)
         logger.debug(
             "[throttle:%s] measure rid=%s n=%d kv_len=%d transient=%.2fMB per_token=%.1fKB ewma=%.1fKB observed_max=%.1fMB samples=%d",
             loop_label,
@@ -4429,9 +5175,9 @@ class Scheduler:
             kv_len,
             delta / 1024**2,
             (delta / max(n_tokens, 1)) / 1024,
-            self._prefill_transient_tracker.bytes_per_token / 1024,
-            self._prefill_transient_tracker.observed_max_bytes / 1024**2,
-            self._prefill_transient_tracker.samples,
+            tracker.bytes_per_token / 1024,
+            tracker.observed_max_bytes / 1024**2,
+            tracker.samples,
         )
 
     def _supports_skip_lm_head(self) -> bool:
@@ -4576,6 +5322,11 @@ class Scheduler:
             if existing_cache is not None
             else make_prompt_cache(self.model)
         )
+        prefill_context = self._new_prefill_context(
+            request,
+            prompt_cache,
+            loop_label="chunked_step",
+        )
 
         block_size = self.config.paged_cache_block_size
         boundary_enabled = (
@@ -4616,6 +5367,7 @@ class Scheduler:
             boundary_enabled=boundary_enabled,
             block_size=block_size,
             total_length=len(tokens),
+            prefill_context=prefill_context,
         )
 
     def _step_prefill_chunk(self, state: _PrefillState) -> bool:
@@ -4661,6 +5413,7 @@ class Scheduler:
             request_id=state.request.request_id,
             loop_label="chunked_step",
             kv_len=state.base_size + state.tokens_processed,
+            prefill_context=state.prefill_context,
         )
 
         # Pre-chunk safety guard (mirrors the external loop): never submit a
@@ -4671,6 +5424,9 @@ class Scheduler:
             progress=state.tokens_processed,
             loop_label="chunked_step",
             request_id=state.request.request_id,
+            request=state.request,
+            prompt_cache=state.cache,
+            prefill_context=state.prefill_context,
         )
 
         _throttle_pre = get_phys_footprint()
@@ -4678,24 +5434,47 @@ class Scheduler:
         # same per-engine stream context as the regular external prefill path.
         # The chunk views stay inside it for the same reason (single-stream
         # chunk eval graph, #2197/#2183).
-        with mx.stream(self._stream):
+        with (
+            _conversion_coordinator.prefill_memory_operation(),
+            mx.stream(self._stream),
+        ):
             chunk = state.tokens_remaining[:, :n]
             state.tokens_remaining = state.tokens_remaining[:, n:]
             if self._supports_skip_lm_head():
                 self.model(chunk, cache=state.cache, skip_lm_head=True)
             else:
                 self.model(chunk, cache=state.cache)
+            measure_post_trigger = (
+                state.prefill_context is not None
+                and state.prefill_context.mid_triggered
+                and state.prefill_context.phase is _PrefillKVPhase.TURBOQUANT
+            )
+            self.model(chunk, cache=state.cache)
             mx.eval([c.state for c in state.cache])
         _throttle_post = get_phys_footprint()
-        self._record_chunk_transient(
-            n,
-            _throttle_pre,
-            _throttle_post,
-            request_id=state.request.request_id,
-            loop_label="chunked_step",
-            kv_len=state.base_size + state.tokens_processed,
-            requested_step=prefill_step_size,
-        )
+        if state.prefill_context is None:
+            self._record_chunk_transient(
+                n,
+                _throttle_pre,
+                _throttle_post,
+                request_id=state.request.request_id,
+                loop_label="chunked_step",
+                kv_len=state.base_size + state.tokens_processed,
+                requested_step=prefill_step_size,
+            )
+        else:
+            self._record_chunk_transient(
+                n,
+                _throttle_pre,
+                _throttle_post,
+                request_id=state.request.request_id,
+                loop_label="chunked_step",
+                kv_len=state.base_size + state.tokens_processed,
+                requested_step=prefill_step_size,
+                phase=state.prefill_context.phase,
+            )
+        if measure_post_trigger and state.prefill_context is not None:
+            state.prefill_context.post_trigger_tokens += n
         self._maybe_record_fixed_state_bytes(state.cache)
         state.tokens_processed += n
 
@@ -4809,15 +5588,22 @@ class Scheduler:
             )
 
     def _finalize_chunked_prefill_cache_for_insert(
-        self, request: "Request", prompt_cache: list[Any] | None
+        self,
+        request: "Request",
+        prompt_cache: list[Any] | None,
+        *,
+        processed_tokens: int = 0,
+        prefill_context: _PrefillContext | None = None,
     ) -> None:
-        """Mirror external prefill's post-prefill cache epilogue."""
-        if not prompt_cache or self._turboquant_kv_bits is None:
+        """Mirror external prefill's typed post-prefill cache epilogue."""
+        if not prompt_cache:
             return
-        if not self._turboquant_eligible(prompt_cache):
-            return
-
-        self._apply_turboquant_kv_convert(prompt_cache)
+        self._finalize_turboquant_prefill_cache(
+            request,
+            prompt_cache,
+            processed_tokens=processed_tokens,
+            context=prefill_context,
+        )
         if getattr(request, "cached_tokens", 0) > 0:
             with mx.stream(self._stream):
                 _materialize_cache_storage(prompt_cache)
@@ -4874,9 +5660,18 @@ class Scheduler:
                     request.request_id,
                     vlm_mtp_uid,
                 )
+                if state.prefill_context is not None:
+                    self._log_mid_prefill_summary(state.prefill_context)
                 return
 
-        self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
+        self._finalize_chunked_prefill_cache_for_insert(
+            request,
+            state.cache,
+            processed_tokens=state.tokens_processed,
+            prefill_context=state.prefill_context,
+        )
+        if state.prefill_context is not None:
+            self._log_mid_prefill_summary(state.prefill_context)
 
         per_row_lps = state.per_row_lps if state.per_row_lps is not None else []
         # insert() merges the prompt cache into the batch KV caches with lazy
@@ -5039,7 +5834,24 @@ class Scheduler:
             # Clean up the prefill-progress tracker entry.
             get_prefill_tracker().remove(rid)
 
-            self._insert_prefilled_request(request, state, scheduled)
+            try:
+                self._insert_prefilled_request(request, state, scheduled)
+            except _PrefillAbortedError:
+                _sync_and_clear_cache(self._stream)
+                self._cleanup_prefill_abort_request(request)
+                continue
+            except PrefillMemoryExceededError as exc:
+                logger.error(
+                    "Chunked prefill completion capacity rejected for %s: %s",
+                    rid,
+                    exc,
+                )
+                self._release_paged_cache_for_request(rid)
+                self.requests.pop(rid, None)
+                self._clear_request_admission_bookkeeping(rid)
+                _sync_and_clear_cache(self._stream)
+                rejected.append(_prefill_memory_exception_output(rid, exc))
+                continue
 
         self.prefilling = still_prefilling
 
@@ -8731,12 +9543,19 @@ class Scheduler:
 
         prompt_tokens = request.num_prompt_tokens
         cached_tokens = request.cached_tokens or 0
+        phase = _PrefillKVPhase.DENSE
+        prompt_cache = getattr(request, "prompt_cache", None)
+        if isinstance(prompt_cache, list):
+            cache_phase, _ = self._classify_prefill_cache(prompt_cache)
+            if cache_phase is _PrefillKVPhase.TURBOQUANT:
+                phase = cache_phase
 
         current = self._current_usage_bytes()
         est = self._admission_estimate(
             num_prompt_tokens=prompt_tokens,
             cached_tokens=cached_tokens,
             current=current,
+            phase=phase,
         )
         if est is None:
             return None  # can't estimate, skip
@@ -8759,6 +9578,8 @@ class Scheduler:
                 requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
             )
+            if self._can_defer_mid_prefill_preflight(phase):
+                return None
 
             message = self._format_rejection_message(
                 estimated=est.estimated,
@@ -8786,6 +9607,8 @@ class Scheduler:
                 requested_tokens=est.floor_chunk,
                 reason="prefill_safety_cap",
             )
+            if self._can_defer_mid_prefill_preflight(phase):
+                return None
             return safety_rejection
         return None
 
@@ -8795,6 +9618,7 @@ class Scheduler:
         num_prompt_tokens: int,
         cached_tokens: int,
         current: int,
+        phase: _PrefillKVPhase = _PrefillKVPhase.DENSE,
     ) -> _AdmissionEstimate | None:
         """Deterministic admission estimate shared by every preflight path.
 
@@ -8845,9 +9669,19 @@ class Scheduler:
         floor_chunk = min(charge_tokens, prefill_tokens)
         kv_len = max(int(num_prompt_tokens) - 1 - floor_chunk, 0)
         kv_exact = int(
-            monitor.estimate_resident_kv_bytes(new_tokens, chunk_tokens=floor_chunk)
+            monitor.estimate_resident_kv_bytes(
+                new_tokens,
+                chunk_tokens=floor_chunk,
+                dtype_size=self._prefill_phase_dtype_size(phase),
+            )
         )
-        transient = int(self._admission_transient_bound(floor_chunk, kv_len))
+        transient = int(
+            self._admission_transient_bound(
+                floor_chunk,
+                kv_len,
+                phase=phase,
+            )
+        )
         if kv_exact <= 0 and transient <= 0:
             return None
         return _AdmissionEstimate(
@@ -8942,6 +9776,8 @@ class Scheduler:
 
         admission_limit = self._admission_limit_bytes()
         if est.estimated > admission_limit:
+            if self._can_defer_mid_prefill_preflight(_PrefillKVPhase.DENSE):
+                return
             message = self._format_rejection_message(
                 estimated=est.estimated,
                 current=current,
@@ -8968,6 +9804,8 @@ class Scheduler:
             current_usage_bytes=current,
         )
         if safety_rejection is None:
+            return
+        if self._can_defer_mid_prefill_preflight(_PrefillKVPhase.DENSE):
             return
 
         logger.warning(
@@ -9581,9 +10419,24 @@ class Scheduler:
                 ):
                     sm = self._build_state_machine(request)
                     per_row_lps = list(logits_processors) if logits_processors else []
-                    state = self._begin_prefill(
-                        request, tokens_to_process, cache_to_use
-                    )
+                    try:
+                        state = self._begin_prefill(
+                            request, tokens_to_process, cache_to_use
+                        )
+                    except PrefillMemoryExceededError as e:
+                        logger.error(
+                            "Chunked prefill setup capacity rejected for %s: %s",
+                            request.request_id,
+                            e,
+                        )
+                        self._release_paged_cache_for_request(request.request_id)
+                        self.requests.pop(request.request_id, None)
+                        self._clear_request_admission_bookkeeping(request.request_id)
+                        get_prefill_tracker().remove(request.request_id)
+                        rejected_outputs.append(
+                            _prefill_memory_exception_output(request.request_id, e)
+                        )
+                        continue
                     state.sampler = sampler
                     state.sm = sm
                     state.per_row_lps = per_row_lps
@@ -9657,7 +10510,31 @@ class Scheduler:
                         self._emit_final_boundary_if_needed(state)
                         _sync_and_clear_cache(self._stream)
                         get_prefill_tracker().remove(request.request_id)
-                        self._insert_prefilled_request(request, state, scheduled)
+                        try:
+                            self._insert_prefilled_request(request, state, scheduled)
+                        except _PrefillAbortedError:
+                            _sync_and_clear_cache(self._stream)
+                            self._cleanup_prefill_abort_request(request)
+                            continue
+                        except PrefillMemoryExceededError as e:
+                            logger.error(
+                                "Chunked prefill completion capacity rejected "
+                                "for %s: %s",
+                                request.request_id,
+                                e,
+                            )
+                            self._release_paged_cache_for_request(request.request_id)
+                            self.requests.pop(request.request_id, None)
+                            self._clear_request_admission_bookkeeping(
+                                request.request_id
+                            )
+                            rejected_outputs.append(
+                                _prefill_memory_exception_output(
+                                    request.request_id,
+                                    e,
+                                )
+                            )
+                            continue
                     else:
                         self.prefilling.append(request)
                         self._prefill_states[request.request_id] = state
@@ -11010,8 +11887,15 @@ class Scheduler:
             if self.prefilling:
                 self._advance_chunked_prefills(chunked_scheduled, chunked_rejected)
 
-            # Schedule waiting requests
-            scheduled, rejected = self._schedule_waiting()
+            # A chunked prefill may have paused for async LRU eviction. Deliver
+            # that request before inspecting the waiting queue: admitting a
+            # second pressured request here could overwrite the single pending
+            # hand-off before EngineCore observes it. The pending request is
+            # consumed below, so waiting admission resumes on the next step.
+            if self._pending_prefill_eviction_request is None:
+                scheduled, rejected = self._schedule_waiting()
+            else:
+                scheduled, rejected = [], []
             # Merge chunked-prefill completions into the scheduled list.
             if chunked_scheduled:
                 scheduled = chunked_scheduled + scheduled
@@ -11562,6 +12446,8 @@ class Scheduler:
                 elif self.model.dtype == mx.bfloat16:
                     base_dtype_size = 2
             dtype_size = base_dtype_size
+            self._prefill_dense_kv_dtype_size = base_dtype_size
+            self._prefill_tq_kv_dtype_size = None
 
             # Extract num_attention_heads (query heads) for SDPA peak estimation
             num_attention_heads = (
@@ -11616,7 +12502,10 @@ class Scheduler:
                     )
                 )
             ):
-                tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
+                tq_dtype_size = turboquant_mse_bytes_per_element(
+                    head_dim,
+                    float(self._turboquant_kv_bits),
+                )
                 if (
                     self._turboquant_skip_last
                     and not isinstance(actual_kv_cache_layers, bool)
@@ -11627,6 +12516,7 @@ class Scheduler:
                     ) / actual_kv_cache_layers
                 else:
                     dtype_size = tq_dtype_size
+                self._prefill_tq_kv_dtype_size = dtype_size
 
             kv_bytes_per_token = (
                 estimate_mla_kv_bytes_per_token(
