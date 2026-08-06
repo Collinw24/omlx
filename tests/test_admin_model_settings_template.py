@@ -102,8 +102,8 @@ def test_all_live_locales_include_mid_prefill_copy_and_correct_parent_semantics(
     )
     assert english["modal.model_settings.turboquant_mid_prefill_hint"] == (
         "When a full prefill chunk cannot fit, convert the growing KV cache once "
-        "and continue prefill with TurboQuant. This adds a one-time pause and may "
-        "slow the rest of prefill."
+        "and continue with TurboQuant. Requires this to be the only loaded model. "
+        "Adds a one-time pause and may slow the rest of prefill."
     )
 
 

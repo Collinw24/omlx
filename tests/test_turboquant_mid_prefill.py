@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_vlm.turboquant import TurboQuantKVCache
 
 from omlx.exceptions import PrefillMemoryExceededError
@@ -31,10 +31,12 @@ from omlx.turboquant_kv import (
     TurboQuantConversionStats,
     convert_kv_cache_sliced,
     estimate_turboquant_conversion_peak_bytes,
+    estimate_turboquant_prefill_attention_workspace_bytes,
     turboquant_mse_bytes_per_element,
 )
 from omlx.utils.metal_sync import (
     _conversion_coordinator,
+    _ConversionCoordinator,
     _mx_buffer_access_lock,
 )
 
@@ -96,6 +98,28 @@ def _assert_buffer_access_lock_available() -> None:
     assert not thread.is_alive()
 
 
+class _TestProcessOwner:
+    pass
+
+
+_active_test_process_owner: _TestProcessOwner | None = None
+
+
+@pytest.fixture(autouse=True)
+def _claim_test_process_owner() -> Any:
+    """Give direct Scheduler fixtures the same fail-closed capability as EnginePool."""
+    global _active_test_process_owner
+    owner = _TestProcessOwner()
+    _conversion_coordinator.register_engine(owner)
+    _conversion_coordinator.claim_process_exclusive(owner)
+    _active_test_process_owner = owner
+    try:
+        yield
+    finally:
+        _active_test_process_owner = None
+        _conversion_coordinator.unregister_engine(owner)
+
+
 def _make_scheduler(*, step_size: int = 4) -> Scheduler:
     model = _AppendModel()
     tokenizer = MagicMock()
@@ -113,6 +137,8 @@ def _make_scheduler(*, step_size: int = 4) -> Scheduler:
     scheduler._turboquant_skip_last = True
     scheduler._turboquant_mid_prefill = True
     scheduler._set_model_info_for_monitor()
+    assert _active_test_process_owner is not None
+    scheduler._metal_process_owner = _active_test_process_owner
     return scheduler
 
 
@@ -189,6 +215,49 @@ def _configure_pressure(
     scheduler._reclaim_prefill_headroom = MethodType(_reclaim, scheduler)
     scheduler._admission_transient_bound = MethodType(_bound, scheduler)
     return cap
+
+def _configure_sizing_band(scheduler: Scheduler) -> tuple[int, int]:
+    mib = 1024**2
+    cap = 10 * mib
+    usage = 6 * mib
+    dense_per_token = 768 * 1024
+    scheduler._memory_limit_bytes = cap
+    scheduler._memory_hard_limit_bytes = cap
+    scheduler._memory_abort_limit_bytes = cap
+    scheduler._prefill_abort_margin = 1.0
+    scheduler._prefill_headroom_safety = 0.8
+    scheduler._prefill_min_chunk_tokens = 1
+    scheduler._prefill_speed_priority = False
+    scheduler._prefill_eviction_callback_configured = False
+
+    def _current(
+        self: Scheduler,
+        refresh_mlx_active: bool = True,
+    ) -> int:
+        del self, refresh_mlx_active
+        return usage
+
+    def _reclaim(self: Scheduler) -> int:
+        del self
+        return usage
+
+    def _predicted(
+        self: Scheduler,
+        n_tokens: int,
+        kv_len: int,
+        *,
+        phase: _PrefillKVPhase = _PrefillKVPhase.DENSE,
+    ) -> float:
+        del self, kv_len
+        if phase is _PrefillKVPhase.TURBOQUANT:
+            return 1024.0
+        return float(n_tokens * dense_per_token)
+
+    scheduler._current_usage_bytes = MethodType(_current, scheduler)
+    scheduler._reclaim_prefill_headroom = MethodType(_reclaim, scheduler)
+    scheduler._predicted_chunk_transient = MethodType(_predicted, scheduler)
+    scheduler._admission_transient_bound = MethodType(_predicted, scheduler)
+    return usage, cap
 
 
 def _state_equal(left: Any, right: Any) -> bool:
@@ -426,76 +495,49 @@ def test_sliced_converter_incremental_mlx_peak_is_within_estimate() -> None:
     assert observed_incremental <= estimate + allocator_tolerance
 
 
-def test_conversion_waits_for_active_chunks_and_blocks_later_chunk() -> None:
-    assert _conversion_coordinator.snapshot() == (0, 0, False, 0)
-    active_chunks = threading.Barrier(3)
-    release_active_chunks = threading.Event()
-    conversion_entered = threading.Event()
-    release_conversion = threading.Event()
-    later_chunk_entered = threading.Event()
-    errors: list[BaseException] = []
+def test_mid_prefill_process_exclusivity_fails_closed() -> None:
+    class _EngineOwner:
+        pass
 
-    def _ordinary_chunk() -> None:
-        try:
-            with _conversion_coordinator.prefill_memory_operation():
-                active_chunks.wait(timeout=5)
-                release_active_chunks.wait(timeout=5)
-        except BaseException as exc:
-            errors.append(exc)
+    coordinator = _ConversionCoordinator()
+    first = _EngineOwner()
+    second = _EngineOwner()
+    later = _EngineOwner()
+    assert coordinator.process_exclusive(None) is False
+    assert coordinator.process_exclusive(first) is False
+    assert coordinator.snapshot() == (0, 0, False, 0)
+    with (
+        pytest.raises(RuntimeError, match="lacks process-exclusive"),
+        coordinator.conversion(process_owner=None),
+    ):
+        pass
 
-    def _conversion() -> None:
-        try:
-            with _conversion_coordinator.conversion():
-                conversion_entered.set()
-                release_conversion.wait(timeout=5)
-        except BaseException as exc:
-            errors.append(exc)
-
-    def _later_chunk() -> None:
-        try:
-            with _conversion_coordinator.prefill_memory_operation():
-                later_chunk_entered.set()
-        except BaseException as exc:
-            errors.append(exc)
-
-    def _conversion_waiting() -> bool:
-        return _conversion_coordinator._waiting_conversions == 1
-
-    first_chunk = threading.Thread(target=_ordinary_chunk, daemon=True)
-    second_chunk = threading.Thread(target=_ordinary_chunk, daemon=True)
-    conversion = threading.Thread(target=_conversion, daemon=True)
-    later_chunk = threading.Thread(target=_later_chunk, daemon=True)
+    coordinator.register_engine(first)
+    coordinator.register_engine(second)
     try:
-        first_chunk.start()
-        second_chunk.start()
-        active_chunks.wait(timeout=5)
-        assert _conversion_coordinator.snapshot()[0] == 2
+        with pytest.raises(RuntimeError, match="unload all other engines"):
+            coordinator.claim_process_exclusive(first)
 
-        conversion.start()
-        with _conversion_coordinator._condition:
-            assert _conversion_coordinator._condition.wait_for(
-                _conversion_waiting,
-                timeout=5,
-            )
-        later_chunk.start()
-        release_active_chunks.set()
-        assert conversion_entered.wait(timeout=5)
-        assert not later_chunk_entered.is_set()
-        release_conversion.set()
-        assert later_chunk_entered.wait(timeout=5)
+        coordinator.unregister_engine(second)
+        coordinator.claim_process_exclusive(first)
+        assert coordinator.process_exclusive(first) is True
+
+        with pytest.raises(RuntimeError, match="unload the mid-prefill model"):
+            coordinator.register_engine(later)
+        with (
+            pytest.raises(RuntimeError, match="Independent Metal work"),
+            coordinator.background_metal_operation(),
+        ):
+            pass
+
+        with coordinator.conversion(process_owner=first):
+            assert coordinator.snapshot()[2] is True
     finally:
-        release_active_chunks.set()
-        release_conversion.set()
-        active_chunks.abort()
-        for thread in (first_chunk, second_chunk, conversion, later_chunk):
-            thread.join(timeout=5)
+        coordinator.unregister_engine(later)
+        coordinator.unregister_engine(second)
+        coordinator.unregister_engine(first)
 
-    assert not errors
-    assert not any(
-        thread.is_alive()
-        for thread in (first_chunk, second_chunk, conversion, later_chunk)
-    )
-    assert _conversion_coordinator.snapshot() == (0, 0, False, 0)
+    assert coordinator.snapshot() == (0, 0, False, 0)
 
 
 def test_guarded_converter_holds_buffer_lock_until_final_cleanup(
@@ -567,7 +609,7 @@ def test_guarded_converter_holds_buffer_lock_until_final_cleanup(
             errors.append(exc)
 
     scheduler._current_usage_bytes = MethodType(_current_usage, scheduler)
-    scheduler._apply_turboquant_kv_convert = _convert
+    scheduler._apply_turboquant_kv_convert_sliced = _convert
     monkeypatch.setattr("omlx.scheduler._sync_and_clear_cache", _no_sync)
     conversion_thread = threading.Thread(target=_run_conversion, daemon=True)
     store_thread = threading.Thread(target=_store_read, daemon=True)
@@ -612,7 +654,9 @@ def test_outstanding_conversion_peak_affects_nonholder_not_holder_post_sample(
     scheduler._hot_cache_cpu_bytes = _zero_hot_cache
     scheduler._last_mlx_active_memory_bytes = base_bytes
 
-    with _conversion_coordinator.conversion() as owner:
+    with _conversion_coordinator.conversion(
+        process_owner=_active_test_process_owner
+    ) as owner:
         accepted, estimated = _conversion_coordinator.try_reserve(
             owner,
             current_bytes=base_bytes,
@@ -659,7 +703,9 @@ def test_process_schedulers_cannot_accept_same_conversion_headroom(
 
     def _first_conversion() -> None:
         try:
-            with _conversion_coordinator.conversion() as owner:
+            with _conversion_coordinator.conversion(
+                process_owner=_active_test_process_owner
+            ) as owner:
                 current = first_scheduler._current_usage_bytes(refresh_mlx_active=False)
                 outcomes["first"], _ = _conversion_coordinator.try_reserve(
                     owner,
@@ -676,7 +722,9 @@ def test_process_schedulers_cannot_accept_same_conversion_headroom(
     def _second_conversion() -> None:
         try:
             first_reserved.wait(timeout=5)
-            with _conversion_coordinator.conversion() as owner:
+            with _conversion_coordinator.conversion(
+                process_owner=_active_test_process_owner
+            ) as owner:
                 current = second_scheduler._current_usage_bytes(
                     refresh_mlx_active=False
                 )
@@ -728,7 +776,7 @@ def test_phase_classifier_requires_one_complete_representation() -> None:
     assert eligible is True
 
     converted = _dense_cache(tokens=4, layers=3)
-    scheduler._apply_turboquant_kv_convert(converted, log_result=False)
+    scheduler._apply_turboquant_kv_convert_sliced(converted, log_result=False)
     phase, eligible = scheduler._classify_prefill_cache(converted)
     assert phase is _PrefillKVPhase.TURBOQUANT
     assert eligible is False
@@ -793,7 +841,7 @@ def test_conversion_safety_cap_rejects_one_byte_before_converter() -> None:
         converter_entered = True
         raise AssertionError("converter entered before safety-cap rejection")
 
-    scheduler._apply_turboquant_kv_convert = _unexpected_convert
+    scheduler._apply_turboquant_kv_convert_sliced = _unexpected_convert
     with pytest.raises(PrefillMemoryExceededError) as exc:
         scheduler._attempt_mid_prefill_conversion(
             request=request,
@@ -843,7 +891,7 @@ def test_conversion_safety_cap_at_or_above_boundary_enters_converter(
         skip_last=True,
     )
     estimated_peak = usage + conversion_peak
-    original_converter = scheduler._apply_turboquant_kv_convert
+    original_converter = scheduler._apply_turboquant_kv_convert_sliced
     converter_entered = False
 
     def _tracking_convert(
@@ -860,7 +908,7 @@ def test_conversion_safety_cap_at_or_above_boundary_enters_converter(
             log_result=log_result,
         )
 
-    scheduler._apply_turboquant_kv_convert = _tracking_convert
+    scheduler._apply_turboquant_kv_convert_sliced = _tracking_convert
     scheduler._attempt_mid_prefill_conversion(
         request=request,
         prompt_cache=cache,
@@ -949,6 +997,83 @@ def test_guard_skips_eviction_pause_without_callback() -> None:
     assert context.phase is _PrefillKVPhase.TURBOQUANT
     assert context.memory_after_bytes < cap
 
+def test_sizing_target_pressure_triggers_conversion_before_abort_cap() -> None:
+    scheduler = _make_scheduler(step_size=4)
+    usage, cap = _configure_sizing_band(scheduler)
+    cache = _dense_cache(tokens=4)
+    request = _make_request("target-band", list(range(9)), cache)
+    scheduler.requests[request.request_id] = request
+    context = scheduler._new_prefill_context(
+        request,
+        cache,
+        loop_label="external",
+    )
+
+    candidate = scheduler._adaptive_chunk_size(
+        4,
+        request_id=request.request_id,
+        loop_label="external",
+        kv_len=4,
+        prefill_context=context,
+    )
+    assert candidate == 4
+    assert scheduler._prefill_sizing_target() == 8 * 1024**2
+    assert usage + scheduler._admission_transient_bound(4, 4) < cap
+
+    result = scheduler._guard_prefill_chunk(
+        candidate,
+        kv_len=4,
+        progress=4,
+        loop_label="external",
+        request_id=request.request_id,
+        request=request,
+        prompt_cache=cache,
+        prefill_context=context,
+    )
+
+    assert result == 4
+    assert context.phase is _PrefillKVPhase.TURBOQUANT
+    assert context.trigger_tokens == 4
+    assert request.turboquant_mid_prefill_attempted is True
+
+
+def test_empty_fresh_cache_resizes_without_conversion() -> None:
+    scheduler = _make_scheduler(step_size=4)
+    _configure_sizing_band(scheduler)
+    cache = _dense_cache()
+    request = _make_request("empty-target-band", list(range(9)), cache)
+    scheduler.requests[request.request_id] = request
+    context = scheduler._new_prefill_context(
+        request,
+        cache,
+        loop_label="external",
+    )
+
+    candidate = scheduler._adaptive_chunk_size(
+        4,
+        request_id=request.request_id,
+        loop_label="external",
+        kv_len=0,
+        prefill_context=context,
+    )
+    assert candidate == 4
+    result = scheduler._guard_prefill_chunk(
+        candidate,
+        kv_len=0,
+        progress=0,
+        loop_label="external",
+        request_id=request.request_id,
+        request=request,
+        prompt_cache=cache,
+        prefill_context=context,
+    )
+
+    assert result == 2
+    assert context.phase is _PrefillKVPhase.DENSE
+    assert context.conversion_attempted is False
+    assert request.turboquant_mid_prefill_attempted is False
+    assert all(cache_obj.empty() for cache_obj in cache)
+
 
 def test_flag_off_guard_never_converts() -> None:
     scheduler = _make_scheduler()
@@ -979,6 +1104,117 @@ def test_flag_off_guard_never_converts() -> None:
     assert request.turboquant_mid_prefill_attempted is False
     assert all(isinstance(cache_obj, KVCache) for cache_obj in cache)
 
+def test_flag_off_finalization_uses_ordinary_direct_converter() -> None:
+    scheduler = _make_scheduler()
+    scheduler._turboquant_mid_prefill = False
+    cache = _dense_cache(tokens=4)
+    request = _make_request("off-final", list(range(5)), cache)
+    context = scheduler._new_prefill_context(
+        request,
+        cache,
+        loop_label="external",
+    )
+
+    def _unexpected(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise AssertionError("mid-prefill-only path ran while disabled")
+
+    scheduler._classify_prefill_cache = _unexpected
+    scheduler._apply_turboquant_kv_convert_sliced = _unexpected
+    scheduler._run_guarded_turboquant_conversion = _unexpected
+    result = scheduler._finalize_turboquant_prefill_cache(
+        request,
+        cache,
+        processed_tokens=4,
+        context=context,
+    )
+
+    assert result is None
+    assert isinstance(cache[0], TurboQuantKVCache)
+    assert isinstance(cache[1], KVCache)
+    assert context.phase is _PrefillKVPhase.DENSE
+
+
+def test_flag_off_restored_prefix_uses_turboquant_suffix_workspace() -> None:
+    scheduler = _make_scheduler(step_size=2048)
+    scheduler._turboquant_mid_prefill = False
+    scheduler._turboquant_kv_bits = 8.0
+    scheduler._set_model_info_for_monitor()
+    assert scheduler.memory_monitor is not None
+    scheduler.memory_monitor.set_model_info(
+        num_layers=64,
+        num_kv_heads=4,
+        head_dim=256,
+        dtype_size=turboquant_mse_bytes_per_element(256, 8.0),
+        num_attention_heads=24,
+        num_kv_cache_layers=8,
+        compute_dtype_size=2,
+    )
+    cache = _dense_cache(tokens=4)
+    scheduler._apply_turboquant_kv_convert(cache)
+    first_layer = cache[0]
+    request = _make_request("off-restored", [4, 5, 6], cache)
+    request.cached_tokens = 4
+    scheduler.requests[request.request_id] = request
+    context = scheduler._new_prefill_context(
+        request,
+        cache,
+        loop_label="external",
+    )
+    phases: list[_PrefillKVPhase] = []
+    original_bound = scheduler._admission_transient_bound
+
+    def _track_bound(
+        self: Scheduler,
+        n_tokens: int,
+        kv_len: int,
+        *,
+        phase: _PrefillKVPhase = _PrefillKVPhase.DENSE,
+    ) -> float:
+        del self
+        phases.append(phase)
+        return original_bound(n_tokens, kv_len, phase=phase)
+
+    def _current_usage(
+        self: Scheduler,
+        refresh_mlx_active: bool = True,
+    ) -> int:
+        del self, refresh_mlx_active
+        return 0
+
+    scheduler._admission_transient_bound = MethodType(_track_bound, scheduler)
+    scheduler._current_usage_bytes = MethodType(_current_usage, scheduler)
+    scheduler._memory_hard_limit_bytes = 16 * 1024**3
+    scheduler._memory_abort_limit_bytes = 16 * 1024**3
+    scheduler._prefill_abort_margin = 1.0
+
+    admitted = scheduler._guard_prefill_chunk(
+        2048,
+        kv_len=131071 - 2048,
+        progress=0,
+        loop_label="external",
+        request_id=request.request_id,
+        request=request,
+        prompt_cache=cache,
+        prefill_context=context,
+    )
+    result, last_token = scheduler._do_external_prefill(
+        request,
+        [4, 5, 6],
+        cache,
+    )
+
+    assert admitted == 2048
+    assert phases and all(phase is _PrefillKVPhase.TURBOQUANT for phase in phases)
+    assert context.phase is _PrefillKVPhase.TURBOQUANT
+    assert context.conversion_eligible is False
+    assert context.started_at is None
+    assert request.turboquant_mid_prefill_attempted is False
+    assert result is cache
+    assert last_token == [6]
+    assert cache[0] is first_layer
+    assert cache[0].offset == cache[1].offset == 6
+
 
 def test_mid_prefill_defers_dense_preflight_to_guard() -> None:
     scheduler = _make_scheduler(step_size=4)
@@ -1001,6 +1237,10 @@ def test_mid_prefill_defers_dense_preflight_to_guard() -> None:
         num_prompt_tokens=request.num_prompt_tokens,
         request_id=request.request_id,
     )
+
+    request.turboquant_mid_prefill_attempted = True
+    assert scheduler._preflight_memory_check(request) is not None
+    request.turboquant_mid_prefill_attempted = False
 
     scheduler._turboquant_mid_prefill = False
     assert scheduler._preflight_memory_check(request) is not None
@@ -1032,7 +1272,7 @@ def test_conversion_failure_discards_every_cache_reference() -> None:
         prompt_cache[0] = TurboQuantKVCache.from_cache(prompt_cache[0], bits=4.0)
         raise RuntimeError("injected conversion failure")
 
-    scheduler._apply_turboquant_kv_convert = _partially_fail
+    scheduler._apply_turboquant_kv_convert_sliced = _partially_fail
     with pytest.raises(
         PrefillMemoryExceededError,
         match="cache was discarded",
@@ -1047,6 +1287,47 @@ def test_conversion_failure_discards_every_cache_reference() -> None:
     assert cache == []
     assert request.prompt_cache is None
     assert request.turboquant_mid_prefill_attempted is True
+    assert raised.value.__context__ is None
+    assert _conversion_coordinator.snapshot() == (0, 0, False, 0)
+    _assert_buffer_access_lock_available()
+
+
+def test_post_prefill_conversion_failure_discards_partial_cache() -> None:
+    scheduler = _make_scheduler()
+    _configure_pressure(scheduler)
+    cache = _dense_cache(tokens=4, layers=3)
+    request = _make_request("post-prefill-failure", list(range(5)), cache)
+    context = scheduler._new_prefill_context(
+        request,
+        cache,
+        loop_label="external",
+    )
+
+    def _partially_fail(
+        prompt_cache: list[Any],
+        *,
+        check_cancelled: Any = None,
+        log_result: bool = True,
+    ) -> TurboQuantConversionStats:
+        del check_cancelled, log_result
+        prompt_cache[0] = TurboQuantKVCache.from_cache(prompt_cache[0], bits=4.0)
+        raise RuntimeError("injected post-prefill conversion failure")
+
+    scheduler._apply_turboquant_kv_convert_sliced = _partially_fail
+    with pytest.raises(
+        PrefillMemoryExceededError,
+        match="post-prefill conversion failed.*cache was discarded",
+    ) as raised:
+        scheduler._finalize_turboquant_prefill_cache(
+            request,
+            cache,
+            processed_tokens=4,
+            context=context,
+        )
+
+    assert cache == []
+    assert request.prompt_cache is None
+    assert request.turboquant_mid_prefill_attempted is False
     assert raised.value.__context__ is None
     assert _conversion_coordinator.snapshot() == (0, 0, False, 0)
     _assert_buffer_access_lock_available()
@@ -1089,7 +1370,7 @@ def test_failure_reclaims_partial_arrays_before_metal_clear(
         del stream
         cleared_after_collect.append(collected_after_release == [True])
 
-    scheduler._apply_turboquant_kv_convert = _fail_with_partial
+    scheduler._apply_turboquant_kv_convert_sliced = _fail_with_partial
     monkeypatch.setattr("omlx.scheduler.gc.collect", _collect)
     monkeypatch.setattr("omlx.scheduler._sync_and_clear_cache", _clear)
     with (
@@ -1149,7 +1430,7 @@ def test_prefill_paths_surface_conversion_failure_and_clear_cache(path: str) -> 
         prompt_cache[0] = TurboQuantKVCache.from_cache(prompt_cache[0], bits=4.0)
         raise RuntimeError("injected path failure")
 
-    scheduler._apply_turboquant_kv_convert = _partially_fail
+    scheduler._apply_turboquant_kv_convert_sliced = _partially_fail
     if path == "external":
         with pytest.raises(PrefillMemoryExceededError, match="cache was discarded"):
             scheduler._do_external_prefill(request, tokens, cache)
@@ -1175,7 +1456,7 @@ def test_post_conversion_oom_requeue_does_not_repeat_mid_prefill_conversion(
     tokens = list(range(9))
     request = _make_request(f"{path}-post-conversion-oom", tokens, cache)
     scheduler.requests[request.request_id] = request
-    original_converter = scheduler._apply_turboquant_kv_convert
+    original_converter = scheduler._apply_turboquant_kv_convert_sliced
     conversion_calls = 0
 
     def _tracking_convert(
@@ -1203,7 +1484,7 @@ def test_post_conversion_oom_requeue_does_not_repeat_mid_prefill_conversion(
     def _reclaim(self: Scheduler) -> int:
         return self._current_usage_bytes()
 
-    scheduler._apply_turboquant_kv_convert = _tracking_convert
+    scheduler._apply_turboquant_kv_convert_sliced = _tracking_convert
     scheduler._current_usage_bytes = MethodType(_current_usage, scheduler)
     scheduler._reclaim_prefill_headroom = MethodType(_reclaim, scheduler)
 
@@ -1398,7 +1679,7 @@ def test_summary_uses_post_conversion_wall_clock(
 
     monkeypatch.setattr("omlx.scheduler.time.perf_counter", _clock)
     scheduler._current_usage_bytes = MethodType(_current_usage, scheduler)
-    scheduler._apply_turboquant_kv_convert = _convert
+    scheduler._apply_turboquant_kv_convert_sliced = _convert
     first_context = scheduler._new_prefill_context(
         request,
         cache,
@@ -1466,7 +1747,7 @@ def test_contexts_and_pretrigger_chunks_avoid_telemetry_clocks(
 
     restored = _make_scheduler(step_size=4)
     restored_cache = _dense_cache(tokens=4)
-    restored._apply_turboquant_kv_convert(restored_cache, log_result=False)
+    restored._apply_turboquant_kv_convert(restored_cache)
     restored_request = _make_request(
         "noneligible-clock",
         [4, 5, 6],
@@ -1543,6 +1824,14 @@ def test_below_trigger_feature_is_cache_output_equivalent() -> None:
     enabled = _make_scheduler(step_size=4)
     disabled = _make_scheduler(step_size=4)
     disabled._turboquant_mid_prefill = False
+    sliced_converter = MagicMock(wraps=enabled._apply_turboquant_kv_convert_sliced)
+    enabled._apply_turboquant_kv_convert_sliced = sliced_converter
+
+    def _unexpected_direct_converter(prompt_cache: list[Any]) -> None:
+        del prompt_cache
+        raise AssertionError("feature-on finalization used the unbounded converter")
+
+    enabled._apply_turboquant_kv_convert = _unexpected_direct_converter
     tokens = list(range(9))
     enabled_cache = _dense_cache()
     disabled_cache = _dense_cache()
@@ -1573,6 +1862,7 @@ def test_below_trigger_feature_is_cache_output_equivalent() -> None:
     assert _state_equal(enabled_values, disabled_values)
     assert enabled_request.turboquant_mid_prefill_attempted is False
     assert disabled_request.turboquant_mid_prefill_attempted is False
+    assert sliced_converter.call_count == 1
     assert mx.array_equal(enabled_cache[1].state[0], disabled_cache[1].state[0]).item()
     assert mx.array_equal(enabled_cache[1].state[1], disabled_cache[1].state[1]).item()
 
@@ -1667,7 +1957,7 @@ def test_complete_turboquant_prefix_extends_without_reconversion() -> None:
     scheduler._memory_hard_limit_bytes = 0
     scheduler._memory_abort_limit_bytes = 0
     cache = _dense_cache(tokens=4)
-    scheduler._apply_turboquant_kv_convert(cache, log_result=False)
+    scheduler._apply_turboquant_kv_convert(cache)
     first_layer = cache[0]
     request = _make_request("restore", [4, 5, 6], cache)
     request.cached_tokens = 4
@@ -1683,6 +1973,40 @@ def test_complete_turboquant_prefix_extends_without_reconversion() -> None:
     assert cache[0] is first_layer
     assert scheduler._classify_prefill_cache(cache)[0] is _PrefillKVPhase.TURBOQUANT
     assert cache[0].offset == cache[1].offset == 6
+
+def test_qwen_style_hybrid_turboquant_prefix_restores_and_extends() -> None:
+    scheduler = _make_scheduler(step_size=4)
+    scheduler._memory_hard_limit_bytes = 0
+    scheduler._memory_abort_limit_bytes = 0
+    first = KVCache()
+    recurrent = ArraysCache(1)
+    last = KVCache()
+    _append_dense(first, tokens=4, value=1.0)
+    _append_dense(last, tokens=4, value=2.0)
+    recurrent[0] = mx.ones((1, 2, 32), dtype=mx.float16)
+    cache: list[Any] = [first, recurrent, last]
+    scheduler._apply_turboquant_kv_convert(cache)
+    converted_first = cache[0]
+    recurrent_state = recurrent[0]
+    request = _make_request("qwen-hybrid-restore", [4, 5, 6], cache)
+    request.cached_tokens = 4
+    scheduler.requests[request.request_id] = request
+
+    result, last_token = scheduler._do_external_prefill(
+        request,
+        [4, 5, 6],
+        cache,
+    )
+
+    assert result is cache
+    assert last_token == [6]
+    assert cache[0] is converted_first
+    assert cache[1] is recurrent
+    assert recurrent[0] is recurrent_state
+    assert isinstance(cache[0], TurboQuantKVCache)
+    assert isinstance(cache[2], KVCache)
+    assert cache[0].offset == cache[2].offset == 6
+    assert scheduler._classify_prefill_cache(cache)[0] is _PrefillKVPhase.TURBOQUANT
 
 
 def test_phase_widths_and_transient_histories_remain_separate() -> None:
@@ -1729,3 +2053,42 @@ def test_phase_widths_and_transient_histories_remain_separate() -> None:
     assert scheduler._prefill_tq_transient_tracker.samples == 1
     assert scheduler._prefill_transient_tracker.last_delta_bytes == 100
     assert scheduler._prefill_tq_transient_tracker.last_delta_bytes == 200
+
+def test_first_qwen_q8_suffix_uses_structural_workspace_bound() -> None:
+    workspace = estimate_turboquant_prefill_attention_workspace_bytes(
+        query_tokens=2048,
+        kv_len=131071,
+        num_query_heads=24,
+        num_kv_heads=4,
+        head_dim=256,
+        bits=8.0,
+        compute_dtype_size=2,
+        causal=True,
+    )
+    assert workspace == 2_687_666_176
+
+    scheduler = _make_scheduler(step_size=2048)
+    scheduler._turboquant_kv_bits = 8.0
+    assert scheduler.memory_monitor is not None
+    scheduler.memory_monitor.set_model_info(
+        num_layers=64,
+        num_kv_heads=4,
+        head_dim=256,
+        dtype_size=turboquant_mse_bytes_per_element(256, 8.0),
+        num_attention_heads=24,
+        num_kv_cache_layers=8,
+        compute_dtype_size=2,
+    )
+    predicted = scheduler._predicted_chunk_transient(
+        2048,
+        131071 - 2048,
+        phase=_PrefillKVPhase.TURBOQUANT,
+    )
+    admission = scheduler._admission_transient_bound(
+        2048,
+        131071 - 2048,
+        phase=_PrefillKVPhase.TURBOQUANT,
+    )
+
+    assert predicted >= workspace * scheduler._PREFILL_TRANSIENT_SAFETY
+    assert admission >= predicted

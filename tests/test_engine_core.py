@@ -135,6 +135,31 @@ class TestEngineCoreInitialization:
                 engine.close()
 
 
+    def test_failed_init_releases_process_registration(
+        self, mock_model, mock_tokenizer
+    ):
+        from omlx.utils.metal_sync import _conversion_coordinator
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.side_effect = [
+                RuntimeError("acquire failed"),
+                True,
+            ]
+            acquisition_error = None
+            try:
+                EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            except RuntimeError as exc:
+                acquisition_error = exc
+
+            assert str(acquisition_error) == "acquire failed"
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                _conversion_coordinator.claim_process_exclusive(engine)
+                assert _conversion_coordinator.process_exclusive(engine) is True
+            finally:
+                engine.close()
+
+
 class TestEngineCoreStartStop:
     """Tests for EngineCore start/stop."""
 
@@ -1380,6 +1405,35 @@ class TestGlobalMLXExecutor:
             finally:
                 engine1.close()
                 engine2.close()
+
+    @pytest.mark.asyncio
+    async def test_mid_prefill_claim_blocks_other_metal_lanes(
+        self,
+        mock_model,
+        mock_tokenizer,
+    ):
+        from omlx.engine_core import get_mlx_executor
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                await engine.claim_turboquant_mid_prefill_process()
+
+                blocked = get_mlx_executor().submit(lambda: "unreachable")
+                with pytest.raises(RuntimeError, match="Independent Metal work"):
+                    blocked.result(timeout=2)
+
+                with pytest.raises(
+                    RuntimeError,
+                    match="unload the mid-prefill model",
+                ):
+                    EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            finally:
+                engine.close()
+
+            allowed = get_mlx_executor().submit(lambda: "allowed")
+            assert allowed.result(timeout=2) == "allowed"
 
     @pytest.mark.asyncio
     async def test_shared_executor_serializes_concurrent_tasks(self):

@@ -822,6 +822,29 @@ class MemoryMonitor:
             )
         return self._estimate_sdpa_activation_bytes(n_tokens, kv_len)
 
+    def estimate_turboquant_prefill_attention_bytes(
+        self,
+        query_tokens: int,
+        kv_len: int,
+        *,
+        bits: float,
+    ) -> int:
+        """Return the source-structural long-prefill TurboQuant workspace."""
+        from .turboquant_kv import (
+            estimate_turboquant_prefill_attention_workspace_bytes,
+        )
+
+        return estimate_turboquant_prefill_attention_workspace_bytes(
+            query_tokens=query_tokens,
+            kv_len=kv_len,
+            num_query_heads=self._num_attention_heads or 0,
+            num_kv_heads=self._num_kv_heads or 0,
+            head_dim=self._head_dim or 0,
+            bits=bits,
+            compute_dtype_size=self._score_dtype_size,
+            causal=True,
+        )
+
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:
         """
         Estimate number of blocks to evict to free the given bytes.

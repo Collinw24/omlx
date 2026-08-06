@@ -22050,13 +22050,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "When a full prefill chunk cannot fit, convert the growing KV cache once and continue prefill with TurboQuant. This adds a one-time pause and may slow the rest of prefill."
+            "value" : "When a full prefill chunk cannot fit, convert the growing KV cache once and continue with TurboQuant. Requires this to be the only loaded model. Adds a one-time pause and may slow the rest of prefill."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "When a full prefill chunk cannot fit, convert the growing KV cache once and continue prefill with TurboQuant. This adds a one-time pause and may slow the rest of prefill."
+            "value" : "When a full prefill chunk cannot fit, convert the growing KV cache once and continue with TurboQuant. Requires this to be the only loaded model. Adds a one-time pause and may slow the rest of prefill."
           }
         }
       }
