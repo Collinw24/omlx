@@ -1673,6 +1673,9 @@ class Scheduler:
         self._turboquant_mid_prefill: bool = False
         self._prefill_dense_kv_dtype_size: float | None = None
         self._prefill_tq_kv_dtype_size: float | None = None
+        # Route-level preflight can only defer a dense-memory rejection when
+        # model cache construction has confirmed a convertible dense layout.
+        self._turboquant_preflight_conversion_eligible: bool | None = None
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
         self._glm_dsa_adaptive_prefill = None
@@ -3033,13 +3036,6 @@ class Scheduler:
             if isinstance(c, CacheList):
                 # A KVCache member inside a CacheList converts fine at
                 # runtime, but the prefix/SSD store paths dispatch on the
-                # layer class ("CacheList") and have no TurboQuant
-                # sub-state serialization: the converted member's
-                # NamedTuple state is flattened to an anonymous tuple on
-                # store and rebuilt as a corrupt dense cache on restore.
-                # Until CacheList-level TQ serialization exists, exclude
-                # composite layers that contain a convertible KVCache
-                # (e.g. inkling's CacheList(KVCache, ArraysCache)).
                 if any(type(inner) is KVCache for inner in c.caches):
                     if not getattr(self, "_tq_cachelist_guard_logged", False):
                         self._tq_cachelist_guard_logged = True
@@ -3054,6 +3050,23 @@ class Scheduler:
 
         return bool(prompt_cache) and all(_ok(c) for c in prompt_cache)
 
+    def _confirm_turboquant_preflight_conversion_eligibility(
+        self,
+        prompt_cache: list[Any],
+    ) -> bool:
+        """Return True only when prompt_cache is an all-dense convertible layout."""
+        if not isinstance(prompt_cache, list) or not prompt_cache:
+            return False
+        if not self._turboquant_eligible(prompt_cache):
+            return False
+        family_targets = [
+            cache_obj
+            for cache_obj in prompt_cache
+            if _is_turboquant_kv_family_cache(cache_obj)
+        ]
+        if not family_targets:
+            return False
+        return all(isinstance(target, _MLXKVCache) for target in family_targets)
     def _classify_prefill_cache(
         self, prompt_cache: list[Any]
     ) -> tuple[_PrefillKVPhase, bool]:
@@ -3508,6 +3521,7 @@ class Scheduler:
                         f"conversion ended in incomplete cache phase "
                         f"{converted_phase.value}"
                     )
+                gc.collect()
                 _sync_and_clear_cache(self._stream)
                 _conversion_coordinator.release_reservation(conversion_owner)
                 after = self._current_usage_bytes()
@@ -3648,7 +3662,7 @@ class Scheduler:
                 getattr(self, "_metal_process_owner", None)
             )
             and phase is _PrefillKVPhase.DENSE
-            and conversion_eligible is not False
+            and conversion_eligible is True
             and (
                 request is None
                 or not request.turboquant_mid_prefill_attempted
@@ -9365,7 +9379,7 @@ class Scheduler:
         prompt_tokens = request.num_prompt_tokens
         cached_tokens = request.cached_tokens or 0
         phase = _PrefillKVPhase.DENSE
-        conversion_eligible: bool | None = None
+        conversion_eligible = self._turboquant_preflight_conversion_eligible
         if getattr(self, "_turboquant_mid_prefill", False):
             prompt_cache = getattr(request, "prompt_cache", None)
             if isinstance(prompt_cache, list):
@@ -9609,7 +9623,10 @@ class Scheduler:
 
         admission_limit = self._admission_limit_bytes()
         if est.estimated > admission_limit:
-            if self._can_defer_mid_prefill_preflight(_PrefillKVPhase.DENSE):
+            if self._can_defer_mid_prefill_preflight(
+                _PrefillKVPhase.DENSE,
+                conversion_eligible=self._turboquant_preflight_conversion_eligible,
+            ):
                 return
             message = self._format_rejection_message(
                 estimated=est.estimated,
@@ -9638,7 +9655,10 @@ class Scheduler:
         )
         if safety_rejection is None:
             return
-        if self._can_defer_mid_prefill_preflight(_PrefillKVPhase.DENSE):
+        if self._can_defer_mid_prefill_preflight(
+            _PrefillKVPhase.DENSE,
+            conversion_eligible=self._turboquant_preflight_conversion_eligible,
+        ):
             return
 
         logger.warning(
@@ -12194,6 +12214,30 @@ class Scheduler:
         if self.memory_monitor is None:
             return
 
+        cache_list_for_tq: list[Any] | None = None
+        self._turboquant_preflight_conversion_eligible = None
+        try:
+            cache_factory = getattr(self.model, "make_cache", None)
+        except Exception:
+            cache_factory = None
+        cache_factory_available = callable(cache_factory)
+        if cache_factory_available:
+            try:
+                cache_candidate = cache_factory()
+            except Exception:
+                pass
+            else:
+                if isinstance(cache_candidate, list):
+                    cache_list_for_tq = cache_candidate
+                    try:
+                        self._turboquant_preflight_conversion_eligible = (
+                            self._confirm_turboquant_preflight_conversion_eligibility(
+                                cache_candidate
+                            )
+                        )
+                    except Exception:
+                        self._turboquant_preflight_conversion_eligible = None
+
         try:
             # Try to get model config
             config = None
@@ -12267,19 +12311,20 @@ class Scheduler:
             )
 
             # Classify layer cache types for hybrid models
-            cache_list_for_tq = None
+            # Reuse the one-shot make_cache probe performed above.
             actual_kv_cache_layers = None
             num_kv_cache_layers = num_layers
             rotating_layer_specs: list[tuple[int, int]] = []
             arrays_cache_layers = 0
-            if not hasattr(self.model, "make_cache"):
+            if not cache_factory_available:
                 actual_kv_cache_layers = num_layers
-            elif collect_kv_layer_specs is not None:
+            elif (
+                cache_list_for_tq is not None
+                and collect_kv_layer_specs is not None
+            ):
                 try:
-                    cache_list = self.model.make_cache()
-                    cache_list_for_tq = cache_list
                     full_layers, rotating_layer_specs, arrays_cache_layers = (
-                        collect_kv_layer_specs(cache_list)
+                        collect_kv_layer_specs(cache_list_for_tq)
                     )
                     actual_kv_cache_layers = full_layers
                     num_kv_cache_layers = full_layers
