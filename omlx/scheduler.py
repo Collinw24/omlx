@@ -3153,7 +3153,10 @@ class Scheduler:
                 return False
             if isinstance(c, CacheList):
                 # A KVCache member inside a CacheList converts fine at
-                # runtime, but the prefix/SSD store paths dispatch on the
+                # runtime, but prefix/SSD storage dispatches on the outer
+                # CacheList class and cannot serialize TurboQuant sub-state.
+                # Flattening that state would restore a corrupt dense cache,
+                # so reject this layout until CacheList has a TQ-aware format.
                 if any(type(inner) is KVCache for inner in c.caches):
                     if not getattr(self, "_tq_cachelist_guard_logged", False):
                         self._tq_cachelist_guard_logged = True
@@ -3185,6 +3188,7 @@ class Scheduler:
         if not family_targets:
             return False
         return all(isinstance(target, _MLXKVCache) for target in family_targets)
+
     def _classify_prefill_cache(
         self, prompt_cache: list[Any]
     ) -> tuple[_PrefillKVPhase, bool]:
@@ -3632,7 +3636,6 @@ class Scheduler:
                     check_cancelled=_check_cancelled,
                     log_result=log_result,
                 )
-                completed_at = time.perf_counter()
                 converted_phase, _ = self._classify_prefill_cache(prompt_cache)
                 if converted_phase is not _PrefillKVPhase.TURBOQUANT:
                     raise RuntimeError(
@@ -3641,6 +3644,7 @@ class Scheduler:
                     )
                 gc.collect()
                 _sync_and_clear_cache(self._stream)
+                completed_at = time.perf_counter()
                 _conversion_coordinator.release_reservation(conversion_owner)
                 after = self._current_usage_bytes()
                 if safety_cap > 0 and after > safety_cap:

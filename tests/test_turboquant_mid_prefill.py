@@ -56,6 +56,7 @@ class _AppendModel:
             head_dim=32,
         )
         self.calls = 0
+
     def make_cache(self) -> list[Any]:
         return [KVCache(), KVCache()]
 
@@ -1716,10 +1717,12 @@ def test_summary_uses_post_conversion_wall_clock(
     mx.eval(converted_first.keys, converted_first.values)
     clock_values = iter((10.0, 12.0, 14.0, 20.0))
     observed_clock_values: list[float] = []
+    events: list[str] = []
 
     def _clock() -> float:
         value = next(clock_values)
         observed_clock_values.append(value)
+        events.append(f"clock:{value}")
         return value
 
     def _current_usage(
@@ -1729,6 +1732,10 @@ def test_summary_uses_post_conversion_wall_clock(
         del self, refresh_mlx_active
         return 1024**3
 
+    def _sync_and_clear(stream: Any) -> None:
+        del stream
+        events.append("sync")
+
     def _convert(
         prompt_cache: list[Any],
         *,
@@ -1736,6 +1743,7 @@ def test_summary_uses_post_conversion_wall_clock(
         log_result: bool = True,
     ) -> TurboQuantConversionStats:
         del check_cancelled, log_result
+        events.append("convert")
         prompt_cache[0] = converted_first
         return TurboQuantConversionStats(
             converted_layers=1,
@@ -1747,6 +1755,7 @@ def test_summary_uses_post_conversion_wall_clock(
         )
 
     monkeypatch.setattr("omlx.scheduler.time.perf_counter", _clock)
+    monkeypatch.setattr("omlx.scheduler._sync_and_clear_cache", _sync_and_clear)
     scheduler._current_usage_bytes = MethodType(_current_usage, scheduler)
     scheduler._apply_turboquant_kv_convert_sliced = _convert
     first_context = scheduler._new_prefill_context(
@@ -1779,6 +1788,14 @@ def test_summary_uses_post_conversion_wall_clock(
         message for message in caplog.messages if "mid-prefill complete" in message
     )
     assert observed_clock_values == [10.0, 12.0, 14.0, 20.0]
+    assert events == [
+        "clock:10.0",
+        "clock:12.0",
+        "convert",
+        "sync",
+        "clock:14.0",
+        "clock:20.0",
+    ]
     assert context.conversion_completed_at == 14.0
     assert "conversion_pause=2.000s" in summary_log
     assert "post_trigger_prefill_tps=0.67 tok/s" in summary_log

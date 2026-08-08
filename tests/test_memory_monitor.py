@@ -669,19 +669,19 @@ class TestEstimateResidentKvBytes:
         m.set_fixed_state_bytes(999)
         assert m.estimate_resident_kv_bytes(0) == 0
 
-    def test_prompt_kv_and_block_memory_use_full_attention_layers(self):
+    def test_prompt_kv_and_block_memory_use_full_attention_layers(self) -> None:
         """Per-block estimates must not charge recurrent layers as KV."""
         m = self._make(num_kv_cache_layers=5, rotating_layer_specs=[(25, 1024)])
         per_layer_token = 8 * 128 * 2 * 2
         assert m.estimate_prompt_kv_bytes(1000) == 1000 * 5 * per_layer_token
         assert m.estimate_block_memory(1) == 5 * per_layer_token
 
-    def test_zero_full_attention_layers_do_not_fall_back_to_all_layers(self):
+    def test_zero_full_attention_layers_do_not_fall_back_to_all_layers(self) -> None:
         m = self._make(num_kv_cache_layers=0, rotating_layer_specs=[(30, 1024)])
         assert m.estimate_prompt_kv_bytes(1000) == 0
         assert m.estimate_block_memory(64) == 0
 
-    def test_qwen_hybrid_turboquant_block_uses_sixteen_kv_layers(self):
+    def test_qwen_hybrid_turboquant_block_uses_sixteen_kv_layers(self) -> None:
         tq_width = (2 + 64 * 4) / 256
         weighted_width = (15 * tq_width + 2) / 16
         m = self._make(
