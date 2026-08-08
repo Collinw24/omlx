@@ -541,6 +541,7 @@ class InsufficientMemoryError(EnginePoolError):
         self.current = current
         super().__init__(message)
 
+
 class TurboQuantProcessExclusiveError(RuntimeError):
     """Raised when temporary process-wide Metal activity blocks exclusivity."""
 

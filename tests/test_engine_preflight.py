@@ -131,9 +131,19 @@ class TestPreflightOrRaise:
     [
         pytest.param([KVCache(), KVCache()], True, id="dense-targets"),
         pytest.param(
+            [KVCache(), RotatingKVCache(max_size=128)],
+            True,
+            id="dense-target-with-pass-through",
+        ),
+        pytest.param(
             [RotatingKVCache(max_size=128)],
             False,
             id="no-turboquant-targets",
+        ),
+        pytest.param(
+            [KVCache(), object()],
+            False,
+            id="unsupported-list-member",
         ),
         pytest.param([], False, id="empty-list"),
         pytest.param(object(), None, id="invalid-output"),
