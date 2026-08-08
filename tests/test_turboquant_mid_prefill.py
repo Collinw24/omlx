@@ -56,6 +56,8 @@ class _AppendModel:
             head_dim=32,
         )
         self.calls = 0
+    def make_cache(self) -> list[Any]:
+        return [KVCache(), KVCache()]
 
     def __call__(
         self,
@@ -1036,6 +1038,73 @@ def test_sizing_target_pressure_triggers_conversion_before_abort_cap() -> None:
     assert context.trigger_tokens == 4
     assert request.turboquant_mid_prefill_attempted is True
 
+
+def test_organic_pressure_triggers_eviction_pause_then_retry_converts() -> None:
+    scheduler = _make_scheduler(step_size=4)
+    cap = _configure_pressure(scheduler)
+    cache = _dense_cache(tokens=4)
+    request = _make_request("organic-flow", list(range(9)), cache)
+    scheduler.requests[request.request_id] = request
+    context = scheduler._new_prefill_context(
+        request,
+        cache,
+        loop_label="external",
+    )
+
+    candidate = scheduler._adaptive_chunk_size(
+        4,
+        request_id=request.request_id,
+        loop_label="external",
+        kv_len=4,
+        prefill_context=context,
+    )
+    assert candidate == 4
+
+    with pytest.raises(_PrefillEvictionNeeded) as exc:
+        scheduler._guard_prefill_chunk(
+            candidate,
+            kv_len=4,
+            progress=4,
+            loop_label="external",
+            request_id=request.request_id,
+            request=request,
+            prompt_cache=cache,
+            prefill_context=context,
+        )
+
+    assert exc.value.request.reason == "turboquant_mid_prefill"
+    assert request.prefill_eviction_retries == 1
+    assert context.conversion_attempted is False
+    assert request.turboquant_mid_prefill_attempted is False
+    assert all(isinstance(cache_obj, KVCache) for cache_obj in cache)
+
+    retry_candidate = scheduler._adaptive_chunk_size(
+        4,
+        request_id=request.request_id,
+        loop_label="external",
+        kv_len=4,
+        prefill_context=context,
+    )
+    assert retry_candidate == 4
+
+    result = scheduler._guard_prefill_chunk(
+        retry_candidate,
+        kv_len=4,
+        progress=4,
+        loop_label="external",
+        request_id=request.request_id,
+        request=request,
+        prompt_cache=cache,
+        prefill_context=context,
+    )
+
+    assert result == 4
+    assert context.phase is _PrefillKVPhase.TURBOQUANT
+    assert context.trigger_tokens == 4
+    assert request.turboquant_mid_prefill_attempted is True
+    assert context.memory_after_bytes < cap
+    assert isinstance(cache[0], TurboQuantKVCache)
+    assert isinstance(cache[1], KVCache)
 
 def test_empty_fresh_cache_resizes_without_conversion() -> None:
     scheduler = _make_scheduler(step_size=4)
