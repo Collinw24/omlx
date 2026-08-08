@@ -509,8 +509,9 @@ def test_supervisor_telemetry_failure_is_retained(
             self.returncode = -9
 
         def wait(self, timeout: float | None = None) -> int:
-            del timeout
-            return -15 if self.returncode is None else self.returncode
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("child", timeout)
+            return self.returncode
 
     process = FakeProcess()
 
@@ -538,6 +539,86 @@ def test_supervisor_telemetry_failure_is_retained(
     assert outcome.error == "no footprint"
     assert outcome.telemetry["samples"] == 0
     assert outcome.telemetry["peak_child_phys_footprint_bytes"] == 0
+
+
+def test_supervisor_accepts_exit_race_after_valid_telemetry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A normal child exit between poll and probe preserves a valid result."""
+
+    class FakeProcess:
+        """Process double that exits while its second footprint probe runs."""
+
+        pid = 321
+
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.terminated = False
+            self.exiting = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        def wait(self, timeout: float | None = None) -> int:
+            if self.returncode is not None:
+                return self.returncode
+            if self.exiting:
+                self.returncode = 0
+                return self.returncode
+            raise subprocess.TimeoutExpired("child", timeout)
+
+    process = FakeProcess()
+    probe_calls = 0
+    result_path = tmp_path / "result.json"
+    result_path.write_text('{"status":"ok"}', encoding="utf-8")
+
+    def _popen(command: list[str], env: dict[str, str]) -> FakeProcess:
+        del command, env
+        return process
+
+    def _racing_probe(pid: int) -> int:
+        nonlocal probe_calls
+        del pid
+        probe_calls += 1
+        if probe_calls == 1:
+            return validation.GIB
+        process.exiting = True
+        raise validation.TelemetryError("no footprint")
+
+    def _safe_pressure() -> validation.MemoryPressureReading:
+        return validation.MemoryPressureReading(
+            total_bytes=64 * validation.GIB,
+            free_percent=25.0,
+            headroom_bytes=16 * validation.GIB,
+        )
+
+    monkeypatch.setattr(subprocess, "Popen", _popen)
+    monkeypatch.setattr(validation, "probe_child_footprint", _racing_probe)
+    monkeypatch.setattr(validation, "probe_memory_pressure", _safe_pressure)
+    monkeypatch.setattr(validation.time, "sleep", lambda seconds: None)
+
+    outcome = validation.supervise_child(
+        command=["child"],
+        environment={},
+        result_path=result_path,
+        poll_interval_seconds=0.01,
+        child_limit_bytes=36 * validation.GIB,
+        host_minimum_bytes=6 * validation.GIB,
+    )
+
+    assert outcome.error is None
+    assert outcome.result == {"status": "ok"}
+    assert outcome.returncode == 0
+    assert outcome.telemetry["samples"] == 1
+    assert outcome.telemetry["peak_child_phys_footprint_bytes"] == validation.GIB
+    assert process.terminated is False
 
 
 def test_supervisor_interrupt_still_terminates_its_child(

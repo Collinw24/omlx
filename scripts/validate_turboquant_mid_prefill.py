@@ -44,6 +44,7 @@ ORGANIC_PROMPT_TOKENS = 131_071
 FIXED_REPLAY_TOKENS = 256
 SCHEMA_VERSION = 1
 GIB = 1024**3
+TELEMETRY_EXIT_GRACE_SECONDS = 1.0
 _FORCE_ENV_PREFIX = "OMLX_FORCE_"
 _MEMORY_TOTAL_RE = re.compile(r"The system has\s+(\d+)\s+\(")
 _MEMORY_FREE_RE = re.compile(r"System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%")
@@ -693,8 +694,18 @@ def supervise_child(
                     _terminate_child(process)
                     break
             except TelemetryError as exc:
-                error = str(exc)
-                _terminate_child(process)
+                # Darwin can stop serving proc_pid_rusage just before waitpid
+                # observes a normal exit. Allow only a bounded teardown grace.
+                try:
+                    process.wait(timeout=TELEMETRY_EXIT_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    error = str(exc)
+                    _terminate_child(process)
+                else:
+                    if samples == 0:
+                        error = (
+                            "child exited before mandatory safety telemetry was sampled"
+                        )
                 break
             time.sleep(poll_interval_seconds)
 
