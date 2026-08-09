@@ -972,7 +972,7 @@ def _teacher_forced_replay(
     latencies: list[float] = []
     nll_values: list[float] = []
     for token_id in replay_ids:
-        row = logits[0, -1]
+        row = logits[0, -1].astype(mx.float32)
         nll = mx.logsumexp(row) - row[int(token_id)]
         mx.eval(nll)
         nll_values.append(float(nll.item()))
