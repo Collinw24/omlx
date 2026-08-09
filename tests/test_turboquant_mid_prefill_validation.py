@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import mlx.core as mx
 import pytest
 
 from scripts import validate_turboquant_mid_prefill as validation
@@ -482,6 +484,32 @@ def test_direct_ordinary_conversion_matches_production_boundary(
     assert metrics["same_boundary_suffix_tokens_per_second"] == pytest.approx(
         metrics["same_boundary_suffix_tokens"] / metrics["same_boundary_suffix_seconds"]
     )
+
+
+def test_teacher_forced_replay_scores_logits_in_float32() -> None:
+    """High-confidence float16 logits retain their small positive NLL."""
+    logits = mx.array([[[7.0, 0.0]]], dtype=mx.float16)
+
+    class FakeModel:
+        """Return fixed logits for the one replay forward."""
+
+        def __call__(self, tokens: Any, *, cache: list[Any]) -> Any:
+            del tokens, cache
+            return logits
+
+    metrics = validation._teacher_forced_replay(
+        mx,
+        FakeModel(),
+        [],
+        logits,
+        [0],
+    )
+
+    assert metrics["mean_nll"] == pytest.approx(
+        math.log1p(math.exp(-7.0)),
+        rel=1e-3,
+    )
+    assert metrics["perplexity"] > 1.0
 
 
 def test_supervisor_telemetry_failure_is_retained(
