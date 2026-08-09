@@ -42,6 +42,8 @@ PRIMARY_PERFORMANCE_ROWS: Mapping[int, str] = {
 ORGANIC_ROW_INDEX = 35
 ORGANIC_PROMPT_TOKENS = 131_071
 FIXED_REPLAY_TOKENS = 256
+ORGANIC_PREFILL_ABORT_MARGIN = 0.95
+ORGANIC_PREFILL_MIN_CHUNK_TOKENS = 32
 SCHEMA_VERSION = 1
 GIB = 1024**3
 TELEMETRY_EXIT_GRACE_SECONDS = 1.0
@@ -1415,13 +1417,22 @@ def _capture_external_prefill_after_pause(
 
 
 def _configure_organic_pressure(
-    scheduler: Any, *, soft_limit_bytes: int, hard_limit_bytes: int
+    scheduler: Any,
+    *,
+    soft_limit_bytes: int,
+    hard_limit_bytes: int,
+    prefill_abort_margin: float,
+    prefill_min_chunk_tokens: int,
 ) -> None:
     """Apply normal propagated scheduler pressure limits without a trigger hook."""
     if soft_limit_bytes <= 0 or hard_limit_bytes <= 0:
         raise ValidationError("organic scheduler limits must be positive")
     if soft_limit_bytes > hard_limit_bytes:
         raise ValidationError("organic soft limit exceeds hard limit")
+    if not 0.0 < prefill_abort_margin <= 1.0:
+        raise ValidationError("organic prefill abort margin must be in (0, 1]")
+    if prefill_min_chunk_tokens <= 0:
+        raise ValidationError("organic prefill minimum chunk must be positive")
     scheduler._memory_limit_bytes = soft_limit_bytes
     scheduler._memory_hard_limit_bytes = hard_limit_bytes
     scheduler._memory_hard_watermark_bytes = hard_limit_bytes
@@ -1430,6 +1441,8 @@ def _configure_organic_pressure(
     scheduler._memory_dynamic_ceiling_bytes = hard_limit_bytes
     scheduler._memory_metal_cap_bytes = hard_limit_bytes
     scheduler._memory_guard_tier = "custom"
+    scheduler._prefill_abort_margin = prefill_abort_margin
+    scheduler._prefill_min_chunk_tokens = prefill_min_chunk_tokens
     scheduler._prefill_memory_guard = True
     scheduler._memory_limits_propagated = True
 
@@ -1500,6 +1513,8 @@ async def _run_organic_child_async(spec: Mapping[str, Any]) -> dict[str, Any]:
             scheduler,
             soft_limit_bytes=int(spec["scheduler_soft_limit_bytes"]),
             hard_limit_bytes=int(spec["scheduler_hard_limit_bytes"]),
+            prefill_abort_margin=float(spec["prefill_abort_margin"]),
+            prefill_min_chunk_tokens=int(spec["prefill_min_chunk_tokens"]),
         )
         request = Request(
             request_id="turboquant-organic-validation",
@@ -1715,6 +1730,8 @@ def _organic_config(args: argparse.Namespace) -> dict[str, Any]:
             "prefill_step_size": args.chunk_size,
             "chunked_prefill": False,
             "prefill_speed_priority": False,
+            "prefill_abort_margin": ORGANIC_PREFILL_ABORT_MARGIN,
+            "prefill_min_chunk_tokens": ORGANIC_PREFILL_MIN_CHUNK_TOKENS,
         },
         "turboquant_bits": 8.0,
         "turboquant_skip_last": True,
@@ -1724,6 +1741,8 @@ def _organic_config(args: argparse.Namespace) -> dict[str, Any]:
         "thinking_enabled": False,
         "scheduler_soft_limit_bytes": int(float(args.scheduler_soft_limit_gib) * GIB),
         "scheduler_hard_limit_bytes": int(float(args.child_memory_gib) * GIB),
+        "prefill_abort_margin": ORGANIC_PREFILL_ABORT_MARGIN,
+        "prefill_min_chunk_tokens": ORGANIC_PREFILL_MIN_CHUNK_TOKENS,
         "child_memory_limit_bytes": int(float(args.child_memory_gib) * GIB),
         "host_headroom_minimum_bytes": int(float(args.host_headroom_gib) * GIB),
         "poll_interval_seconds": args.poll_interval,
@@ -1838,6 +1857,8 @@ def run_parent(args: argparse.Namespace) -> int:
                     "no_cache": True,
                     "exclusive_ownership": True,
                     "forced_trigger": False,
+                    "prefill_abort_margin": ORGANIC_PREFILL_ABORT_MARGIN,
+                    "prefill_min_chunk_tokens": ORGANIC_PREFILL_MIN_CHUNK_TOKENS,
                 }
                 spec = {
                     "schema_version": SCHEMA_VERSION,
@@ -1853,6 +1874,8 @@ def run_parent(args: argparse.Namespace) -> int:
                     "scheduler_hard_limit_bytes": int(
                         float(args.child_memory_gib) * GIB
                     ),
+                    "prefill_abort_margin": ORGANIC_PREFILL_ABORT_MARGIN,
+                    "prefill_min_chunk_tokens": ORGANIC_PREFILL_MIN_CHUNK_TOKENS,
                 }
                 outcome = _run_supervised_spec(
                     spec=spec,
