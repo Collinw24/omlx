@@ -723,7 +723,32 @@ def test_organic_contract_uses_natural_fixed_prompt_without_force_controls() -> 
     assert config["exclusive_ownership"] is True
     assert config["no_cache"] is True
     assert config["forced_trigger"] is False
+    assert config["scheduler"]["prefill_abort_margin"] == 0.95
+    assert config["scheduler"]["prefill_min_chunk_tokens"] == 32
+    assert config["prefill_abort_margin"] == 0.95
+    assert config["prefill_min_chunk_tokens"] == 32
     assert not any(key.startswith("OMLX_FORCE_") for key in config)
+
+
+def test_organic_pressure_uses_production_custom_tier_controls() -> None:
+    """Manual limits retain custom-tier abort and minimum-chunk controls."""
+    scheduler = SimpleNamespace()
+
+    validation._configure_organic_pressure(
+        scheduler,
+        soft_limit_bytes=32 * validation.GIB,
+        hard_limit_bytes=37 * validation.GIB,
+        prefill_abort_margin=validation.ORGANIC_PREFILL_ABORT_MARGIN,
+        prefill_min_chunk_tokens=validation.ORGANIC_PREFILL_MIN_CHUNK_TOKENS,
+    )
+
+    assert scheduler._memory_limit_bytes == 32 * validation.GIB
+    assert scheduler._memory_abort_limit_bytes == 37 * validation.GIB
+    assert scheduler._memory_guard_tier == "custom"
+    assert scheduler._prefill_abort_margin == 0.95
+    assert scheduler._prefill_memory_guard is True
+    assert scheduler._prefill_min_chunk_tokens == 32
+    assert scheduler._memory_limits_propagated is True
 
 
 def test_organic_first_attempt_requires_real_eviction_pause() -> None:
