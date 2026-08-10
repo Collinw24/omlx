@@ -1111,6 +1111,16 @@ private struct ExperimentalSection: View {
                         .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
                 }
             }
+            if vm.showsTurboquantMidPrefill {
+                Row(label: turboquantMidPrefillLabel,
+                    sublabel: turboquantMidPrefillHelp) {
+                    Toggle(turboquantMidPrefillLabel,
+                           isOn: vm.bindProfile($vm.turboquantMidPrefill))
+                        .labelsHidden().toggleStyle(.switch)
+                        .disabled(vm.dflashEnabled)
+                        .help(turboquantMidPrefillHelp)
+                }
+            }
 
             // IndexCache (DSA-only — surface to the user that the row
             // only applies to models whose config matches the DSA set).
@@ -1370,8 +1380,20 @@ private struct ExperimentalSection: View {
     private var turboquantSublabel: String {
         if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
         return String(localized: "settings.experimental.turboquant.sub",
-                      defaultValue: "Quantize the KV cache during prefill. Saves memory at a small quality cost.",
-                      comment: "Sublabel describing TurboQuant KV cache")
+                      defaultValue: "Convert the KV cache after prefill for generation. Saves memory at a small quality cost.",
+                      comment: "Sublabel describing the normal TurboQuant KV cache conversion path")
+    }
+
+    private var turboquantMidPrefillLabel: String {
+        String(localized: "settings.experimental.turboquant.mid_prefill.label",
+               defaultValue: "Convert during prefill",
+               comment: "Subordinate TurboQuant row label for converting the KV cache under prefill memory pressure")
+    }
+
+    private var turboquantMidPrefillHelp: String {
+        String(localized: "settings.experimental.turboquant.mid_prefill.sub",
+               defaultValue: "Under prefill memory pressure, convert the growing KV cache once and continue with TurboQuant. Requires this model to be the only loaded engine; unavailable with DFlash.",
+               comment: "Help text for converting the TurboQuant KV cache once under prefill memory pressure")
     }
 
     private var specprefillSublabel: String {
@@ -1382,7 +1404,9 @@ private struct ExperimentalSection: View {
     }
 
     private var dflashToggleDisabled: Bool {
-        !(vm.model?.dflashCompatible ?? true) || vm.vlmMtpEnabled
+        !(vm.model?.dflashCompatible ?? true)
+            || vm.vlmMtpEnabled
+            || (vm.turboquantKvEnabled && vm.turboquantMidPrefill)
     }
 
     private var dflashHelp: String {
@@ -1390,7 +1414,11 @@ private struct ExperimentalSection: View {
            !(vm.model?.dflashCompatible ?? true) {
             return reason
         }
-        return vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : ""
+        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
+        if vm.turboquantKvEnabled && vm.turboquantMidPrefill {
+            return turboquantMidPrefillHelp
+        }
+        return ""
     }
 
     private var dflashSublabel: String {
@@ -1399,6 +1427,9 @@ private struct ExperimentalSection: View {
             return reason
         }
         if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
+        if vm.turboquantKvEnabled && vm.turboquantMidPrefill {
+            return turboquantMidPrefillHelp
+        }
         return String(localized: "settings.experimental.dflash.sub",
                       defaultValue: "Block-diffusion speculative decoding. Single-stream only (requests run one at a time).",
                       comment: "Default sublabel for the DFlash toggle (used when the model is compatible)")

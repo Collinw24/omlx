@@ -560,6 +560,8 @@
   "modal.model_settings.limit_tool_placeholder": "例如 2000",
   "modal.model_settings.turboquant_kv": "TurboQuant KV Cache",
   "modal.model_settings.turboquant_kv_hint": "使用向量量化壓縮 KV 快取。較低位元 = 更多壓縮，較高位元 = 更佳品質。支援 2 到 8 位元。",
+  "modal.model_settings.turboquant_mid_prefill": "預填充期間轉換",
+  "modal.model_settings.turboquant_mid_prefill_hint": "預填充期間出現記憶體壓力時，將持續增長的 KV 快取轉換一次，並以 TurboQuant 繼續處理。此模型必須是唯一載入的引擎，且無法與 DFlash 同時使用。",
   "modal.model_settings.turboquant_kv_bits_label": "每通道位元數",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "使用模型內建的 MTP 頭，每步產生多個 token。解碼速度最快可達約 1.5 倍。（Qwen 3.5/3.6、DeepSeek-V4、GLM-5.2）",

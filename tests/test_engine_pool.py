@@ -6,6 +6,7 @@ import concurrent.futures
 import json
 import logging
 import shutil
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -18,6 +19,7 @@ from omlx.exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
     ModelUnavailableError,
+    TurboQuantProcessExclusiveError,
 )
 from omlx.scheduler import PrefillEvictionRequest
 
@@ -3602,3 +3604,69 @@ class TestLoadRefusalNamesBindingCeiling:
         assert "dynamic memory ceiling" in message
         assert "close other apps" in message.lower()
         assert "lower memory_guard_tier" not in message
+
+
+class TestTurboQuantMidPrefillProcessExclusivity:
+    @staticmethod
+    def _entry(model_id: str, engine: object | None = None) -> EngineEntry:
+        return EngineEntry(
+            model_id=model_id,
+            model_path=f"/tmp/{model_id}",
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1,
+            engine=engine,
+        )
+
+    def test_runtime_signature_ignores_child_when_parent_is_disabled(self):
+        from omlx.model_settings import ModelSettings
+
+        pool = EnginePool()
+        disabled = ModelSettings(
+            turboquant_kv_enabled=False,
+            turboquant_mid_prefill=False,
+        )
+        inert_child = ModelSettings(
+            turboquant_kv_enabled=False,
+            turboquant_mid_prefill=True,
+        )
+        active_child = ModelSettings(
+            turboquant_kv_enabled=True,
+            turboquant_mid_prefill=True,
+        )
+
+        assert pool._engine_runtime_signature("model", disabled) == (
+            pool._engine_runtime_signature("model", inert_child)
+        )
+        assert pool._engine_runtime_signature("model", active_child) != (
+            pool._engine_runtime_signature("model", disabled)
+        )
+
+    def test_loaded_mid_prefill_engine_blocks_other_model(self):
+        pool = EnginePool()
+        owner = SimpleNamespace(
+            scheduler=SimpleNamespace(_turboquant_mid_prefill=True)
+        )
+        pool._entries["owner"] = self._entry("owner", owner)
+        pool._entries["other"] = self._entry("other")
+
+        with pytest.raises(TurboQuantProcessExclusiveError, match="unload 'owner'"):
+            pool._raise_if_other_mid_prefill_model_owns_process("other")
+
+    @pytest.mark.asyncio
+    async def test_claim_requires_no_other_loaded_engine(self):
+        pool = EnginePool()
+        process_owner = SimpleNamespace(
+            claim_turboquant_mid_prefill_process=AsyncMock()
+        )
+        scheduler = SimpleNamespace(_metal_process_owner=process_owner)
+        pool._entries["target"] = self._entry("target")
+        pool._entries["other"] = self._entry("other", MagicMock())
+
+        with pytest.raises(TurboQuantProcessExclusiveError, match="loaded: other"):
+            await pool._claim_turboquant_mid_prefill_process("target", scheduler)
+        process_owner.claim_turboquant_mid_prefill_process.assert_not_awaited()
+
+        pool._entries["other"].engine = None
+        await pool._claim_turboquant_mid_prefill_process("target", scheduler)
+        process_owner.claim_turboquant_mid_prefill_process.assert_awaited_once()

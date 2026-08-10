@@ -2,10 +2,14 @@
 """Tests for the OQManager admin component."""
 
 import json
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from omlx.admin import oq_manager
 from omlx.admin.oq_manager import OQManager, QuantStatus, QuantTask
+from omlx.exceptions import TurboQuantProcessExclusiveError
+from omlx.utils.metal_sync import _ConversionCoordinator
 
 
 @pytest.fixture
@@ -630,3 +634,24 @@ class TestOQManagerEnhanced:
         assert task.output_name == "Llama-3B-oQ4e"
         assert ".oqe_imatrix" in task.imatrix_cache_path
         assert task.imatrix_cache_path.endswith("-s8-l128.npz")
+
+
+
+def test_process_exclusive_engine_blocks_quantization_metal_work():
+    coordinator = _ConversionCoordinator()
+
+    class Owner:
+        pass
+
+    owner = Owner()
+    coordinator.register_engine(owner)
+    coordinator.claim_process_exclusive(owner)
+    operation = MagicMock()
+
+    with (
+        patch.object(oq_manager, "_conversion_coordinator", coordinator),
+        pytest.raises(TurboQuantProcessExclusiveError),
+    ):
+        oq_manager._run_process_guarded_metal(operation)
+
+    operation.assert_not_called()

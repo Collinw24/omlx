@@ -437,6 +437,10 @@ class BatchedEngine(BaseEngine):
         scheduler = self._engine.engine.scheduler
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            scheduler._turboquant_mid_prefill = bool(
+                tq_enabled
+                and getattr(self._model_settings, "turboquant_mid_prefill", False)
+            )
             if tq_enabled:
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 scheduler._turboquant_kv_bits = tq_bits

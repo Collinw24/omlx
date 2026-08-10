@@ -23,11 +23,17 @@ from omlx.engine_core import (
     EngineConfig,
     EngineCore,
     _raise_request_output_error,
+    get_mlx_executor,
 )
-from omlx.exceptions import PrefillMemoryAbortedError, PrefillMemoryExceededError
+from omlx.exceptions import (
+    PrefillMemoryAbortedError,
+    PrefillMemoryExceededError,
+    TurboQuantProcessExclusiveError,
+)
 from omlx.output_collector import RequestOutputCollector
 from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
+from omlx.utils.metal_sync import _ConversionCoordinator
 
 
 class TestEngineConfig:
@@ -1888,3 +1894,51 @@ class TestMemoryAbortErrorSurface:
                 self._abort_output(error_code=None, error_metadata=None)
             )
         assert not isinstance(exc.value, PrefillMemoryExceededError)
+
+
+
+class TestTurboQuantProcessExclusivity:
+    @pytest.mark.asyncio
+    async def test_claim_blocks_global_executor_until_close(
+        self, mock_model, mock_tokenizer
+    ):
+        coordinator = _ConversionCoordinator()
+        with (
+            patch("omlx.engine_core.get_registry") as mock_registry,
+            patch("omlx.engine_core._conversion_coordinator", coordinator),
+        ):
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                await engine.claim_turboquant_mid_prefill_process()
+                assert coordinator.process_exclusive(engine)
+
+                with pytest.raises(TurboQuantProcessExclusiveError):
+                    get_mlx_executor().submit(lambda: None).result(timeout=5)
+            finally:
+                engine.close()
+
+            assert get_mlx_executor().submit(lambda: 42).result(timeout=5) == 42
+
+    @pytest.mark.asyncio
+    async def test_claim_requires_the_only_registered_engine(
+        self, mock_model, mock_tokenizer
+    ):
+        coordinator = _ConversionCoordinator()
+        with (
+            patch("omlx.engine_core.get_registry") as mock_registry,
+            patch("omlx.engine_core._conversion_coordinator", coordinator),
+        ):
+            mock_registry.return_value.acquire.return_value = True
+            first = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            second = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                with pytest.raises(TurboQuantProcessExclusiveError):
+                    await first.claim_turboquant_mid_prefill_process()
+
+                second.close()
+                await first.claim_turboquant_mid_prefill_process()
+                assert coordinator.process_exclusive(first)
+            finally:
+                first.close()
+                second.close()

@@ -98,3 +98,31 @@ async def test_sampling_setting_change_keeps_cached_failure():
     assert entry.load_failed is True
     assert entry.load_failure_message == "trust_remote_code=True required"
     assert entry.load_failure_at == 123.0
+
+
+@pytest.mark.asyncio
+async def test_mid_prefill_dflash_conflict_rejects_final_state_without_mutation():
+    pool, _ = _failed_pool()
+    settings = ModelSettings(
+        dflash_enabled=True,
+        turboquant_kv_enabled=True,
+        turboquant_mid_prefill=False,
+    )
+    manager = MagicMock()
+    manager.get_settings.return_value = settings
+
+    with (
+        patch("omlx.admin.routes._get_engine_pool", return_value=pool),
+        patch("omlx.admin.routes._get_settings_manager", return_value=manager),
+        patch("omlx.admin.routes._get_server_state", return_value=MagicMock()),
+        pytest.raises(admin_routes.HTTPException) as exc_info,
+    ):
+        await admin_routes.update_model_settings(
+            "ling",
+            admin_routes.ModelSettingsRequest(turboquant_mid_prefill=True),
+            is_admin=True,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert settings.turboquant_mid_prefill is False
+    manager.set_settings.assert_not_called()

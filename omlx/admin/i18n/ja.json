@@ -560,6 +560,8 @@
   "modal.model_settings.limit_tool_placeholder": "例: 2000",
   "modal.model_settings.turboquant_kv": "TurboQuant KV Cache",
   "modal.model_settings.turboquant_kv_hint": "Compress KV cache using vector quantization. Reduces memory ~60-75% with near-lossless quality for long context.",
+  "modal.model_settings.turboquant_mid_prefill": "プリフィル中に変換",
+  "modal.model_settings.turboquant_mid_prefill_hint": "プリフィル中にメモリが逼迫した場合、増加中の KV キャッシュを一度変換し、TurboQuant で処理を続行します。このモデルが唯一ロードされたエンジンである必要があり、DFlash とは併用できません。",
   "modal.model_settings.turboquant_kv_bits_label": "Bits per channel",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "Drafts several tokens per step with the model's built-in MTP head. Up to ~1.5x faster decoding. (Qwen 3.5/3.6, DeepSeek-V4, GLM-5.2)",

@@ -294,6 +294,24 @@ class TestApplyProfile:
         mgr.save_profile("m", "p", "P", None, {"turboquant_kv_enabled": True})
         mgr.apply_profile("m", "p")
         assert mgr.get_settings("m").turboquant_kv_enabled is True
+    def test_apply_roundtrips_turboquant_mid_prefill(self, mgr):
+        mgr.save_profile(
+            "m",
+            "p",
+            "P",
+            None,
+            {
+                "turboquant_kv_enabled": True,
+                "turboquant_mid_prefill": True,
+            },
+        )
+
+        mgr.apply_profile("m", "p")
+
+        settings = mgr.get_settings("m")
+        assert settings.turboquant_kv_enabled is True
+        assert settings.turboquant_mid_prefill is True
+
 
     def test_apply_tolerates_legacy_empty_string_values(self, tmp_path):
         profiles_file = tmp_path / "model_profiles.json"

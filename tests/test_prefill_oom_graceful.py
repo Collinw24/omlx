@@ -513,14 +513,56 @@ def test_adaptive_throttle_charges_recently_reclaimed_footprint():
     assert _call(ns, 2048, kv_len=147_680) < 2048
 
 
+def test_repeated_reclaims_do_not_lock_throttle_below_full_size():
+    """Current must gain headroom when several chunks release memory."""
+    hard = 37 * _GB
+    static_prediction = 1 * _GB
+    monitor = SimpleNamespace(
+        estimate_chunk_transient_bytes=lambda _n, _kv: (
+            static_prediction / Scheduler._PREFILL_TRANSIENT_SAFETY
+        ),
+        estimate_prompt_kv_bytes=lambda _n: 0,
+    )
+    ns = _throttle_ctx(
+        current=32.5 * _GB,
+        hard=hard,
+        monitor=monitor,
+    )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns,
+        Scheduler,
+    )
+    ns._fake_current = 32.5 * _GB
+
+    assert _call(ns, 2048, kv_len=120_000) < 2048
+
+    ns._record_chunk_transient(
+        32,
+        int(32.5 * _GB),
+        int(32.0 * _GB),
+        request_id="r",
+        loop_label="test",
+        requested_step=2048,
+    )
+    ns._record_chunk_transient(
+        32,
+        int(32.0 * _GB),
+        int(31.5 * _GB),
+        request_id="r",
+        loop_label="test",
+        requested_step=2048,
+    )
+    ns._fake_current = 31.5 * _GB
+
+    assert _call(ns, 2048, kv_len=120_064) == 2048
+
+
 def test_predicted_transient_does_not_double_count_reclaim_covered_by_raw():
     """A conservative raw-last sample may already cover pool reallocation."""
     raw_prediction = 11.83 * _GB
     static_prediction = 4.11 * _GB
     released = 6.86 * _GB
-    raw_per_token = raw_prediction / (
-        512 * Scheduler._PREFILL_TRANSIENT_SAFETY
-    )
+    raw_per_token = raw_prediction / (512 * Scheduler._PREFILL_TRANSIENT_SAFETY)
     monitor = SimpleNamespace(
         estimate_chunk_transient_bytes=lambda _n, _kv: (
             static_prediction / Scheduler._PREFILL_TRANSIENT_SAFETY
@@ -674,23 +716,19 @@ def test_record_chunk_transient_marks_floor_samples_only():
     # First sample is always excluded from the max (seed noise).
     ns._record_chunk_transient(32, 0, 100, request_id="r", loop_label="unit")
     # Big chunk: EWMA only, never the max.
-    ns._record_chunk_transient(
-        2048, 0, 3 * 1024**3, request_id="r", loop_label="unit"
-    )
+    ns._record_chunk_transient(2048, 0, 3 * 1024**3, request_id="r", loop_label="unit")
     assert tracker.observed_max_bytes == 0
     # Floor chunk: enters the max.
-    ns._record_chunk_transient(
-        32, 0, 200 * 1024**2, request_id="r", loop_label="unit"
-    )
+    ns._record_chunk_transient(32, 0, 200 * 1024**2, request_id="r", loop_label="unit")
     assert tracker.observed_max_bytes == 200 * 1024**2
 
 
-def test_record_chunk_transient_skips_partial_speed_sample():
-    """A speed tail must not replace the last representative full step."""
+def test_record_chunk_transient_skips_partial_sample():
+    """A throttled partial must not replace the representative full step."""
     tracker = PrefillTransientTracker()
     ns = SimpleNamespace(
         _prefill_min_chunk_tokens=32,
-        _prefill_speed_priority=True,
+        _prefill_speed_priority=False,
         _prefill_transient_tracker=tracker,
         _PREFILL_TRANSIENT_SAFETY=Scheduler._PREFILL_TRANSIENT_SAFETY,
         memory_monitor=None,
@@ -724,9 +762,100 @@ def test_record_chunk_transient_skips_partial_speed_sample():
     assert tracker.last_n_tokens == 2048
     assert tracker.last_delta_bytes == full_delta
     predicted = Scheduler._predicted_chunk_transient(ns, 2048, 65_000)
-    assert predicted == pytest.approx(
-        full_delta * Scheduler._PREFILL_TRANSIENT_SAFETY
+    assert predicted == pytest.approx(full_delta * Scheduler._PREFILL_TRANSIENT_SAFETY)
+
+
+def test_record_chunk_transient_trains_stable_partial_tier():
+    """A 512/1024 partial tracks context growth without floor feedback."""
+    tracker = PrefillTransientTracker()
+    ns = SimpleNamespace(
+        _prefill_min_chunk_tokens=32,
+        _prefill_transient_tracker=tracker,
+        _PREFILL_TRANSIENT_SAFETY=Scheduler._PREFILL_TRANSIENT_SAFETY,
+        memory_monitor=None,
     )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    full_delta = 512 * 1024**2
+    stable_partial_delta = 1536 * 1024**2
+    ns._record_chunk_transient(
+        2048,
+        0,
+        full_delta,
+        request_id="req-full",
+        loop_label="unit",
+        requested_step=2048,
+    )
+    ns._record_chunk_transient(
+        1024,
+        0,
+        stable_partial_delta,
+        request_id="req-tier",
+        loop_label="unit",
+        requested_step=2048,
+    )
+
+    assert tracker.samples == 2
+    assert tracker.last_n_tokens == 1024
+    assert tracker.last_delta_bytes == stable_partial_delta
+    predicted = Scheduler._predicted_chunk_transient(ns, 1024, 175_000)
+    assert predicted == pytest.approx(
+        stable_partial_delta * Scheduler._PREFILL_TRANSIENT_SAFETY
+    )
+
+    ns._record_chunk_transient(
+        256,
+        0,
+        3 * 1024**3,
+        request_id="req-small",
+        loop_label="unit",
+        requested_step=2048,
+    )
+    assert tracker.samples == 2
+    assert tracker.last_n_tokens == 1024
+
+
+def test_partial_floor_updates_bound_without_training_rate():
+    tracker = PrefillTransientTracker()
+    ns = SimpleNamespace(
+        _prefill_min_chunk_tokens=32,
+        _prefill_transient_tracker=tracker,
+    )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns,
+        Scheduler,
+    )
+    full_delta = 512 * 1024**2
+    ns._record_chunk_transient(
+        2048,
+        0,
+        full_delta,
+        request_id="full",
+        loop_label="unit",
+        requested_step=2048,
+    )
+    ns._record_chunk_transient(
+        32,
+        0,
+        100 * 1024**2,
+        request_id="floor-1",
+        loop_label="unit",
+        requested_step=2048,
+    )
+    ns._record_chunk_transient(
+        32,
+        0,
+        200 * 1024**2,
+        request_id="floor-2",
+        loop_label="unit",
+        requested_step=2048,
+    )
+
+    assert tracker.samples == 1
+    assert tracker.last_n_tokens == 2048
+    assert tracker.last_delta_bytes == full_delta
+    assert tracker.observed_max_bytes == 200 * 1024**2
 
 
 def test_record_chunk_transient_keeps_full_speed_spike_as_last_sample():
@@ -764,8 +893,8 @@ def test_record_chunk_transient_keeps_full_speed_spike_as_last_sample():
     assert tracker.last_delta_bytes == spike
 
 
-def test_record_chunk_transient_keeps_partial_context_sample():
-    """Context priority still learns from adaptively reduced chunks."""
+def test_record_chunk_transient_skips_first_partial_context_sample():
+    """A reduced chunk cannot seed the rate that selected its own size."""
     tracker = PrefillTransientTracker()
     ns = SimpleNamespace(
         _prefill_min_chunk_tokens=32,
@@ -776,19 +905,18 @@ def test_record_chunk_transient_keeps_partial_context_sample():
         ns, Scheduler
     )
 
-    partial_delta = 128 * 1024**2
     ns._record_chunk_transient(
         512,
         0,
-        partial_delta,
+        128 * 1024**2,
         request_id="req-context",
         loop_label="unit",
         requested_step=2048,
     )
 
-    assert tracker.samples == 1
-    assert tracker.last_n_tokens == 512
-    assert tracker.last_delta_bytes == partial_delta
+    assert tracker.samples == 0
+    assert tracker.last_n_tokens == 0
+    assert tracker.last_delta_bytes == 0
 
 
 def test_step_prefill_reclaims_before_first_guard():
@@ -1073,12 +1201,9 @@ class TestMaybeRecordFixedStateBytes:
 
     def test_zero_total_marks_recorded_without_setting(self):
         ns = self._ns()
-        ns._maybe_record_fixed_state_bytes(
-            [type("KVCache", (), {"state": []})()]
-        )
+        ns._maybe_record_fixed_state_bytes([type("KVCache", (), {"state": []})()])
         ns.memory_monitor.set_fixed_state_bytes.assert_not_called()
         assert ns._fixed_state_recorded is True
-
 
 
 # --------------------------------------------------------------------------

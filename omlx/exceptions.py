@@ -542,6 +542,10 @@ class InsufficientMemoryError(EnginePoolError):
         super().__init__(message)
 
 
+class TurboQuantProcessExclusiveError(RuntimeError):
+    """Raised when process-exclusive TurboQuant Metal access cannot be granted."""
+
+
 class ModelLoadingError(EnginePoolError):
     """Raised when a model load is unavailable, blocked, or invalid."""
 

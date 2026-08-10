@@ -1702,6 +1702,10 @@ class VLMBatchedEngine(BaseEngine):
         scheduler = self._engine.engine.scheduler
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            scheduler._turboquant_mid_prefill = bool(
+                tq_enabled
+                and getattr(self._model_settings, "turboquant_mid_prefill", False)
+            )
             if tq_enabled:
                 from ..patches.turboquant_attention import (
                     apply_turboquant_attention_patch,

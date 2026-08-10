@@ -59,8 +59,21 @@ class TestEwmaOutlierGuard:
         # ~/.omlx/logs/server.log 16:08:48-16:09:39 (KB/token), replayed as
         # (n_tokens=2048, transient_bytes) pairs.
         baseline_kb_per_token = [
-            1058.0, 1171.0, 1085.0, 1103.0, 1123.1, 1141.3, 991.2, 1131.2,
-            1099.3, 1839.3, 1867.3, 1186.5, 1031.4, 1529.5, 1117.5,
+            1058.0,
+            1171.0,
+            1085.0,
+            1103.0,
+            1123.1,
+            1141.3,
+            991.2,
+            1131.2,
+            1099.3,
+            1839.3,
+            1867.3,
+            1186.5,
+            1031.4,
+            1529.5,
+            1117.5,
         ]
         for kb in baseline_kb_per_token:
             t.update(n_tokens=2048, transient_bytes=int(kb * 1024 * 2048))
@@ -173,6 +186,25 @@ class TestObservedMax:
         ewma = 0.3 * 200.0 + 0.7 * 100.0
         assert abs(t.bytes_per_token - ewma) < 0.01
         assert t.predict(2000, safety_factor=1.0) == int(ewma * 2000)
+
+
+class TestRecentReclaim:
+    def test_consecutive_drops_keep_one_chunk_bound(self):
+        tracker = PrefillTransientTracker("m")
+
+        tracker.record_reclaim(2_000)
+        tracker.record_reclaim(3_000)
+        tracker.record_reclaim(1_000)
+
+        assert tracker.recent_reclaim_bytes == 3_000
+
+    def test_positive_sample_clears_bound(self):
+        tracker = PrefillTransientTracker("m")
+        tracker.record_reclaim(3_000)
+
+        tracker.update(32, 1_000)
+
+        assert tracker.recent_reclaim_bytes == 0
 
 
 class TestReset:

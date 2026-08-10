@@ -57,25 +57,52 @@ class PrefillTransientTracker:
         # gates, matching the floor-chunk charge they price. Never used
         # for chunk sizing.
         self._observed_max_bytes: int = 0
-        # Net process footprint released by negative post-chunk deltas. MLX may
-        # need to allocate that pool again on the next chunk, so the scheduler
-        # prices it once until a positive measurement confirms reallocation.
+        # Number of positive floor observations, kept separate from EWMA
+        # samples because throttled partial chunks do not train the rate.
+        self._floor_samples: int = 0
+        # Largest process-footprint drop since the last positive sample. A
+        # single chunk can reallocate that pool, but summing consecutive drops
+        # creates a non-decaying charge: current falls by exactly the amount
+        # the charge rises, so the throttle can never leave its floor.
         self._recent_reclaim_bytes: int = 0
 
     def record_reclaim(self, reclaimed_bytes: int) -> None:
-        """Accumulate footprint released since the last positive sample."""
+        """Retain the largest one-chunk footprint that may be reallocated."""
         if reclaimed_bytes > 0:
-            self._recent_reclaim_bytes += int(reclaimed_bytes)
+            self._recent_reclaim_bytes = max(
+                self._recent_reclaim_bytes,
+                int(reclaimed_bytes),
+            )
 
     def clear_reclaim(self) -> None:
         """Drop the charge once any positive measurement confirms realloc.
 
         Callers invoke this for every positive delta, including samples the
-        EWMA gates skip (sub-floor tails, speed-priority partials) — the
+        EWMA gates skip (sub-floor tails and partial requested steps) — the
         footprint has grown back, so keeping the charge would double count
         against the guard's gates.
         """
         self._recent_reclaim_bytes = 0
+
+    def record_floor_transient(self, transient_bytes: int) -> None:
+        """Record a floor-chunk bound without training the per-token rate."""
+        if transient_bytes <= 0:
+            return
+        if self._samples > 0 or self._floor_samples > 0:
+            if transient_bytes <= self._OBSERVED_MAX_CLAMP_BYTES:
+                self._observed_max_bytes = max(
+                    self._observed_max_bytes,
+                    transient_bytes,
+                )
+            else:
+                logger.debug(
+                    "PrefillTransientTracker(%s): rejected %d-byte outlier "
+                    "from observed max (clamp %d)",
+                    self._model_id,
+                    transient_bytes,
+                    self._OBSERVED_MAX_CLAMP_BYTES,
+                )
+        self._floor_samples += 1
 
     def update(
         self, n_tokens: int, transient_bytes: int, *, floor_sample: bool = False
@@ -108,21 +135,10 @@ class PrefillTransientTracker:
 
         self._recent_reclaim_bytes = 0
 
-        # The very first sample after a model load carries weight page-fault
-        # and load-residue noise, so it seeds the EWMA but is excluded from
-        # the running max.
-        if floor_sample and self._samples > 0:
-            if transient_bytes <= self._OBSERVED_MAX_CLAMP_BYTES:
-                if transient_bytes > self._observed_max_bytes:
-                    self._observed_max_bytes = transient_bytes
-            else:
-                logger.debug(
-                    "PrefillTransientTracker(%s): rejected %d-byte outlier "
-                    "from observed max (clamp %d)",
-                    self._model_id,
-                    transient_bytes,
-                    self._OBSERVED_MAX_CLAMP_BYTES,
-                )
+        # The first floor observation after a model load carries weight
+        # page-fault and load-residue noise, so exclude it from the max.
+        if floor_sample:
+            self.record_floor_transient(transient_bytes)
 
         per_token = transient_bytes / n_tokens
         if self._samples == 0:
@@ -188,7 +204,7 @@ class PrefillTransientTracker:
 
     @property
     def recent_reclaim_bytes(self) -> int:
-        """Footprint released since the last positive chunk measurement."""
+        """Largest one-chunk footprint drop since positive growth."""
         return self._recent_reclaim_bytes
 
     def reset(self) -> None:
@@ -198,4 +214,5 @@ class PrefillTransientTracker:
         self._last_delta_bytes = 0
         self._last_n_tokens = 0
         self._observed_max_bytes = 0
+        self._floor_samples = 0
         self._recent_reclaim_bytes = 0

@@ -679,6 +679,31 @@ class TestEstimateResidentKvBytes:
         # estimate_block_memory: all num_layers, ignores layer classes.
         assert m.estimate_block_memory(1) == 30 * 8 * 128 * 2 * 2
 
+    def test_paged_writer_prices_dense_snapshots_and_fixed_state_once(self):
+        m = self._make(
+            num_layers=4,
+            num_kv_cache_layers=2,
+            num_kv_heads=2,
+            head_dim=8,
+            dtype_size=0.5,
+            compute_dtype_size=2,
+            rotating_layer_specs=[(2, 4)],
+        )
+        m.set_fixed_state_bytes(123)
+
+        dense_linear = 8 * 2 * 8 * 2 * 2 * 2
+        compressed_linear = 8 * 2 * 8 * 0.5 * 2 * 2
+        rotating = 2 * (4 + 8 - 1) * 2 * 8 * 2 * 2
+
+        assert (
+            m.estimate_paged_writer_block_memory(8, dtype_size=2)
+            == dense_linear + rotating + 123
+        )
+        assert (
+            m.estimate_paged_writer_block_memory(8)
+            == compressed_linear + rotating + 123
+        )
+
 
 class TestSetModelInfoFromModelRotating:
     """DFlash mirror: set_model_info_from_model classifies via the shared
@@ -778,6 +803,22 @@ class TestDeepSeekV4PrefillMemoryProfile:
             monitor.estimate_resident_kv_bytes(tokens, chunk_tokens=chunk) == expected
         )
         assert expected < 2 * 1024**3
+
+    def test_paged_writer_does_not_double_count_profiled_rotating_state(self):
+        monitor = self._monitor()
+        monitor.set_fixed_state_bytes(123)
+        block_size = 2048
+        profile = monitor._prefill_memory_profile
+        assert profile is not None
+        expected = profile.estimate_resident_kv_bytes(
+            block_size,
+            chunk_tokens=block_size,
+        )
+
+        assert (
+            monitor.estimate_paged_writer_block_memory(block_size)
+            == expected + 123
+        )
 
     def test_prefill_transient_does_not_charge_dense_full_context_sdpa(self):
         from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes

@@ -936,6 +936,7 @@ class TestFilterUploadedSettings:
         out = _filter_uploaded_settings(
             self._settings(
                 turboquant_kv_enabled=True,
+                turboquant_mid_prefill=True,
                 turboquant_kv_bits=4,
                 mtp_enabled=True,
                 mtp_num_draft_tokens=3,
@@ -943,6 +944,7 @@ class TestFilterUploadedSettings:
                 guided_grammar_enabled=True,
             )
         )
+        assert out["turboquant_mid_prefill"] is True
         assert out["turboquant_kv_bits"] == 4
         assert out["mtp_num_draft_tokens"] == 3
         assert out["index_cache_freq"] == 4

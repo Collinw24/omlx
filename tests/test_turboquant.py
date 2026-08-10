@@ -430,7 +430,10 @@ def test_attention_patch_preserves_sinks_with_dequant_fallback(monkeypatch):
     assert calls["sdpa_key_shape"] == keys.shape
 
 
-def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(monkeypatch):
+@pytest.mark.parametrize("bits", [4.0, 8.0])
+def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(
+    monkeypatch, bits
+):
     from mlx_lm.models import base as mlx_base
 
     from omlx.patches import turboquant_attention as tq_attention
@@ -443,7 +446,7 @@ def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(monkeypat
         mx.random.normal((1, 2, 8, 32)),
         mx.random.normal((1, 2, 8, 32)),
     )
-    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=bits)
     ks, vs = tq.state
     calls = []
     prefill_calls = []
@@ -458,7 +461,7 @@ def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(monkeypat
         self, queries, keys_state=None, values_state=None, scale=1.0, mask=None
     ):
         calls.append((keys_state, values_state, self.prefill_query_block_size))
-        assert self.prefill_key_chunk_size == 16384
+        assert self.prefill_key_chunk_size == 4096
         return mx.zeros_like(queries)
 
     monkeypatch.setattr(
@@ -482,10 +485,48 @@ def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(monkeypat
     assert len(calls) == 1
     assert calls[0][0] is ks
     assert calls[0][1] is vs
-    assert calls[0][2] == 256
+    assert calls[0][2] == 512
 
 
-def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
+@pytest.mark.parametrize("bits", [4.0, 8.0])
+def test_attention_patch_real_long_mse_prefill_never_dequantizes(
+    monkeypatch, bits
+):
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
+
+    apply_turboquant_attention_patch()
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 2, 8193, 32)),
+        mx.random.normal((1, 2, 8193, 32)),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=bits)
+    ks, vs = tq.state
+
+    def fail_dequantize(self, *args, **kwargs):
+        raise AssertionError("long MSE prefill must not dequantize")
+
+    monkeypatch.setattr(TurboQuantKVCache, "dequantize", fail_dequantize)
+    queries = mx.random.normal((1, 4, 16, 32))
+
+    out = mlx_base.scaled_dot_product_attention(
+        queries,
+        ks,
+        vs,
+        tq,
+        scale=32**-0.5,
+        mask=None,
+    )
+    mx.eval(out)
+
+    assert out.shape == queries.shape
+    assert mx.all(mx.isfinite(out)).item()
+
+
+@pytest.mark.parametrize("bits", [4.0, 8.0])
+def test_attention_patch_propagates_quantized_prefill_failure(monkeypatch, bits):
     from mlx_lm.models import base as mlx_base
 
     from omlx.patches import turboquant_attention as tq_attention
@@ -498,7 +539,7 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
         mx.random.normal((1, 2, 8, 32)),
         mx.random.normal((1, 2, 8, 32)),
     )
-    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=bits)
     ks, vs = tq.state
     calls = {"quantized": 0, "dequantize": 0}
 
@@ -506,27 +547,24 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
         calls["quantized"] += 1
         raise RuntimeError("forced quantized prefill failure")
 
-    original_dequantize = TurboQuantKVCache.dequantize
-
-    def spy_dequantize(self, *args, **kwargs):
+    def fail_dequantize(self, *args, **kwargs):
         calls["dequantize"] += 1
-        return original_dequantize(self, *args, **kwargs)
+        raise AssertionError("long quantized prefill must fail closed")
 
     monkeypatch.setattr(
         TurboQuantKVCache,
         "quantized_attention",
         failing_quantized_attention,
     )
-    monkeypatch.setattr(TurboQuantKVCache, "dequantize", spy_dequantize)
+    monkeypatch.setattr(TurboQuantKVCache, "dequantize", fail_dequantize)
 
     queries = mx.random.normal((1, 4, 2, 32))
-    out = mlx_base.scaled_dot_product_attention(
-        queries, ks, vs, tq, scale=32**-0.5, mask=None
-    )
-    mx.eval(out)
+    with pytest.raises(RuntimeError, match="forced quantized prefill failure"):
+        mlx_base.scaled_dot_product_attention(
+            queries, ks, vs, tq, scale=32**-0.5, mask=None
+        )
 
-    assert out.shape == queries.shape
-    assert calls == {"quantized": 1, "dequantize": 1}
+    assert calls == {"quantized": 1, "dequantize": 0}
 
 
 @pytest.mark.parametrize("q_len", [2, 4, 9])

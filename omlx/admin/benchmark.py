@@ -301,6 +301,7 @@ _UPLOADED_SETTING_FIELDS = (
     "model_type_override",
     "index_cache_freq",
     "turboquant_kv_enabled",
+    "turboquant_mid_prefill",
     "turboquant_kv_bits",
     "turboquant_skip_last",
     "specprefill_enabled",

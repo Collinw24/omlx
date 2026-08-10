@@ -257,6 +257,26 @@ class TestModelSettings:
         assert d["turboquant_skip_last"] is False
         restored = ModelSettings.from_dict(d)
         assert restored.turboquant_skip_last is False
+    def test_turboquant_mid_prefill_default_off(self):
+        settings = ModelSettings()
+        assert settings.turboquant_mid_prefill is False
+
+    def test_turboquant_mid_prefill_rejects_effective_dflash_combination(self):
+        with pytest.raises(ValueError, match="turboquant_mid_prefill.*dflash"):
+            ModelSettings(
+                dflash_enabled=True,
+                turboquant_kv_enabled=True,
+                turboquant_mid_prefill=True,
+            )
+
+    def test_turboquant_mid_prefill_is_inert_without_turboquant(self):
+        settings = ModelSettings(
+            dflash_enabled=True,
+            turboquant_kv_enabled=False,
+            turboquant_mid_prefill=True,
+        )
+        assert settings.turboquant_mid_prefill is True
+
 
     def test_native_mtp_allows_turboquant(self):
         settings = ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)

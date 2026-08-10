@@ -560,6 +560,8 @@
   "modal.model_settings.limit_tool_placeholder": "ex: 2000",
   "modal.model_settings.turboquant_kv": "Cache KV TurboQuant",
   "modal.model_settings.turboquant_kv_hint": "Comprimir o cache KV usando quantização vetorial. Menos bits = mais compressão, mais bits = melhor qualidade. Suporta de 2 a 8 bits.",
+  "modal.model_settings.turboquant_mid_prefill": "Converter durante o prefill",
+  "modal.model_settings.turboquant_mid_prefill_hint": "Sob pressão de memória durante o prefill, converte uma vez o cache KV em crescimento e continua com o TurboQuant. Este modelo deve ser o único mecanismo carregado; indisponível com DFlash.",
   "modal.model_settings.turboquant_kv_bits_label": "Bits por canal",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "Drafts several tokens per step with the model's built-in MTP head. Up to ~1.5x faster decoding. (Qwen 3.5/3.6, DeepSeek-V4, GLM-5.2)",

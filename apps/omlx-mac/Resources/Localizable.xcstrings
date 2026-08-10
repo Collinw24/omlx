@@ -22007,26 +22007,74 @@
         }
       }
     },
-    "settings.experimental.turboquant.sub" : {
-      "comment" : "Sublabel describing TurboQuant KV cache",
+    "settings.experimental.turboquant.mid_prefill.label" : {
+      "comment" : "Subordinate TurboQuant row label for converting the KV cache under prefill memory pressure",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Quantize the KV cache during prefill. Saves memory at a small quality cost."
+            "value" : "Convert during prefill"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Квантовать KV-кэш во время префилла. Экономит память с небольшой потерей качества."
+            "value" : "Преобразовать во время префилла"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在预填充期间量化 KV 缓存。以微小的质量代价节省内存。"
+            "value" : "在预填充期间转换"
+          }
+        }
+      }
+    },
+    "settings.experimental.turboquant.mid_prefill.sub" : {
+      "comment" : "Help text for converting the TurboQuant KV cache once under prefill memory pressure",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Under prefill memory pressure, convert the growing KV cache once and continue with TurboQuant. Requires this model to be the only loaded engine; unavailable with DFlash."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "При нехватке памяти во время префилла один раз преобразует растущий KV-кэш и продолжает работу с TurboQuant. Эта модель должна быть единственным загруженным движком; несовместимо с DFlash."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "预填充期间出现内存压力时，将增长中的 KV 缓存转换一次，并使用 TurboQuant 继续处理。此模型必须是唯一加载的引擎，且不能与 DFlash 同时使用。"
+          }
+        }
+      }
+    },
+    "settings.experimental.turboquant.sub" : {
+      "comment" : "Sublabel describing the normal TurboQuant KV cache conversion path",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Convert the KV cache after prefill for generation. Saves memory at a small quality cost."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Квантовать KV-кэш после префилла для генерации. Экономит память с небольшой потерей качества."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "预填充完成后转换 KV 缓存用于生成。以轻微的质量损失节省内存。"
           }
         }
       }

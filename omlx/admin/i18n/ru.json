@@ -560,6 +560,8 @@
   "modal.model_settings.limit_tool_placeholder": "например, 2000",
   "modal.model_settings.turboquant_kv": "TurboQuant KV-кэш",
   "modal.model_settings.turboquant_kv_hint": "Сжимайте KV-кэш с помощью векторного квантования. Меньшее число бит = сильнее сжатие, большее = лучше качество. Поддерживает от 2 до 8 бит.",
+  "modal.model_settings.turboquant_mid_prefill": "Преобразовать во время префилла",
+  "modal.model_settings.turboquant_mid_prefill_hint": "При нехватке памяти во время префилла один раз преобразует растущий KV-кэш и продолжает работу с TurboQuant. Эта модель должна быть единственным загруженным движком; несовместимо с DFlash.",
   "modal.model_settings.turboquant_kv_bits_label": "Битов на канал",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "Использует встроенную MTP-голову модели для черновой генерации нескольких токенов за шаг. Декодирование до ~1,5× быстрее. (Qwen 3.5/3.6, DeepSeek-V4, GLM-5.2)",

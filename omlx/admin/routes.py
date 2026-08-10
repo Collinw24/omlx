@@ -126,6 +126,7 @@ class ModelSettingsRequest(BaseModel):
     thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool | None = None
+    turboquant_mid_prefill: bool | None = None
     turboquant_kv_bits: float | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
@@ -516,6 +517,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["thinking_budget_enabled"] = False
     settings["guided_grammar_enabled"] = False
     settings["turboquant_kv_enabled"] = False
+    settings["turboquant_mid_prefill"] = False
     settings["turboquant_kv_bits"] = 4
     settings["turboquant_skip_last"] = True
     settings["specprefill_enabled"] = False
@@ -591,6 +593,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
 
     settings.index_cache_freq = None
     settings.turboquant_kv_enabled = False
+    settings.turboquant_mid_prefill = False
     settings.turboquant_kv_bits = 4
     settings.turboquant_skip_last = True
     settings.specprefill_enabled = False
@@ -2155,6 +2158,38 @@ async def update_model_settings(
         model_id, current_settings
     )
     is_diffusion_model = _entry_is_diffusion_model(entry)
+    proposed_turboquant_enabled = (
+        bool(request.turboquant_kv_enabled)
+        if "turboquant_kv_enabled" in sent
+        else current_settings.turboquant_kv_enabled
+    )
+    proposed_mid_prefill = (
+        bool(request.turboquant_mid_prefill)
+        if "turboquant_mid_prefill" in sent
+        else current_settings.turboquant_mid_prefill
+    )
+    proposed_dflash_enabled = (
+        False
+        if is_diffusion_model
+        else (
+            bool(request.dflash_enabled)
+            if "dflash_enabled" in sent
+            else current_settings.dflash_enabled
+        )
+    )
+    if (
+        proposed_dflash_enabled
+        and proposed_turboquant_enabled
+        and proposed_mid_prefill
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "TurboQuant mid-prefill cannot be enabled with DFlash; "
+                "disable one of them."
+            ),
+        )
+
     if "model_alias" in sent:
         alias_value = request.model_alias.strip() if request.model_alias else None
         if alias_value == "":
@@ -2273,6 +2308,10 @@ async def update_model_settings(
     # TurboQuant KV cache settings
     if "turboquant_kv_enabled" in sent:
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
+    if "turboquant_mid_prefill" in sent:
+        current_settings.turboquant_mid_prefill = (
+            request.turboquant_mid_prefill or False
+        )
     if "turboquant_kv_bits" in sent:
         current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
     # SpecPrefill settings
@@ -2536,6 +2575,7 @@ async def update_model_settings(
 
     if is_diffusion_model:
         _sanitize_diffusion_model_settings(current_settings)
+
 
     # If an active profile was set, clear it when the user's save diverges
     # from the profile's stored values.  Only compare fields present in

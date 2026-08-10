@@ -9,25 +9,32 @@ When TurboQuantKVCache is detected, routes attention to:
     are folded into the GQA repeat dimension so the codecs' decode kernels
     apply, with the causal tail mask injected between key scoring and the
     value weighted sum — one lazy pass over the KV, no dequantize
-  - Prefill (L>1): cache.prefill_attention() fast path, fallback to
-    dequantize + mx.fast.scaled_dot_product_attention
+  - Prefill (L>1): cache.prefill_attention(); long quantized cache states use
+    bounded quantized attention, while shorter states may dequantize for SDPA
 """
 
 import logging
 from functools import cache
-from typing import Optional
+from typing import Any
 
 import mlx.core as mx
+
+from ..turboquant_kv import (
+    _TURBOQUANT_DECODE_MULTIROW_MAX_Q_LEN,
+    TURBOQUANT_PREFILL_KEY_CHUNK_TOKENS,
+    TURBOQUANT_PREFILL_QUERY_BLOCK_TOKENS,
+    _turboquant_next_capacity,
+)
 
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
 _LONG_PREFILL_QUANTIZED_THRESHOLD = 8192
-_LONG_PREFILL_QUERY_BLOCK_SIZE = 256
-_LONG_PREFILL_KEY_CHUNK_SIZE = 16384
+_LONG_PREFILL_QUERY_BLOCK_SIZE = TURBOQUANT_PREFILL_QUERY_BLOCK_TOKENS
+_LONG_PREFILL_KEY_CHUNK_SIZE = TURBOQUANT_PREFILL_KEY_CHUNK_TOKENS
 # MTP verify is a decode-shaped multi-row call (q_len = 1 + draft depth <= 9).
 # Above this floor a multi-row call is genuine (chunked) prefill.
-_DECODE_MULTIROW_MAX_Q_LEN = 15
+_DECODE_MULTIROW_MAX_Q_LEN = _TURBOQUANT_DECODE_MULTIROW_MAX_Q_LEN
 # The repeat kernels unroll per-repeat register arrays, so folding is only a
 # win while n_repeats * q_len stays under the register-pressure knee
 # (measured: 24 fine, 30+ loses to single-chunk quantized_attention).
@@ -385,14 +392,13 @@ def _decode_multirow_attention(real_cache, queries, keys, values, scale):
 
 
 def _patch_update_eval_policy() -> None:
-    """Skip the per-layer eval for decode-shaped multi-row cache appends.
+    """Grow packed prefill capacity geometrically and bound live copy graphs.
 
-    Upstream ``update_and_fetch`` forces ``mx.eval`` whenever more than one
-    token is appended — a graph-bounding measure sized for prefill chunks.
-    MTP verify appends 2..9 rows per layer, so that policy serializes every
-    layer of every verify cycle (~15 forced syncs/cycle). Raise the eval
-    floor to prefill-sized appends; verify rows stay lazy and materialize
-    at the cycle's sampling sync like the rest of the forward.
+    Steady-state appends stay lazy until the scheduler evaluates the whole
+    model call. Staged mid-prefill pre-reserves each growth and clears the
+    released allocator buffers before the forward. This fallback materializes
+    any unplanned growth immediately so live old/new graphs do not stack.
+    Decode and MTP retain the periodic graph bound.
     """
     from mlx_vlm import turboquant as _tq
 
@@ -400,9 +406,11 @@ def _patch_update_eval_policy() -> None:
     if getattr(cls, "_omlx_multirow_eval_patched", False):
         return
 
-    def update_and_fetch(self, keys, values):
-        # Mirror of upstream TurboQuantKVCache.update_and_fetch; the only
-        # change is the eval gate (n_new > 1 -> prefill-sized appends).
+    def update_and_fetch(
+        self: Any,
+        keys: mx.array,
+        values: mx.array,
+    ) -> tuple[Any, Any]:
         self._ensure_codecs(keys, values)
 
         new_keys, new_values = self._try_fused_kv_quantize(keys, values)
@@ -410,28 +418,44 @@ def _patch_update_eval_policy() -> None:
             new_keys = self.key_codec.quantize(keys)
             new_values = self.value_codec.quantize(values)
 
-        new_end = self.offset + keys.shape[2]
+        n_new = int(keys.shape[2])
+        grew_capacity = False
+        new_end = self.offset + n_new
         if self.keys is None:
             self.keys = _tq._allocate_state_like(new_keys, new_end)
             self.values = _tq._allocate_state_like(new_values, new_end)
         else:
+            current_capacity = int(_tq._state_length(self.keys))
+            target_capacity = _turboquant_next_capacity(
+                current_capacity,
+                offset=int(self.offset),
+                n_tokens=n_new,
+                cache_step=int(self.cache_step),
+            )
+            grew_capacity = target_capacity > current_capacity
             self.keys = _tq._reserve_state_capacity(
-                self.keys, self.offset, new_end, self.cache_step
+                self.keys,
+                self.offset,
+                target_capacity,
+                self.cache_step,
             )
             self.values = _tq._reserve_state_capacity(
-                self.values, self.offset, new_end, self.cache_step
+                self.values,
+                self.offset,
+                target_capacity,
+                self.cache_step,
             )
 
         _tq._write_state(self.keys, new_keys, self.offset)
         _tq._write_state(self.values, new_values, self.offset)
 
-        n_heads = keys.shape[1]
-        n_new = keys.shape[2]
-
+        n_heads = int(keys.shape[1])
         self.offset = new_end
         self._cached_state = None
         self._cached_state_offset = -1
-        if n_new > _DECODE_MULTIROW_MAX_Q_LEN or (self.offset % 50 == 0):
+        if grew_capacity or (
+            n_new <= _DECODE_MULTIROW_MAX_Q_LEN and self.offset % 50 == 0
+        ):
             mx.eval(self.keys, self.values)
         ks, vs = self.state
         return (
@@ -479,9 +503,7 @@ def _patch_vlm_target_verify_attention() -> None:
 
         sdpa = q35_lang.scaled_dot_product_attention
         if queries.shape[0] == 1 and not isinstance(mask, mx.array):
-            return sdpa(
-                queries, keys, values, cache=cache, scale=scale, mask="causal"
-            )
+            return sdpa(queries, keys, values, cache=cache, scale=scale, mask="causal")
         # Left-padded batches / explicit array masks: dequantize once and
         # replicate the caller's per-row causal slicing on dense arrays.
         dk, dv = real_cache.dequantize(keys_state=keys, values_state=values)
@@ -539,17 +561,18 @@ def apply_turboquant_attention_patch() -> bool:
     original_sdpa = mlx_base.scaled_dot_product_attention
 
     def patched_sdpa(
-        queries,
-        keys,
-        values,
-        cache,
+        queries: mx.array,
+        keys: Any,
+        values: Any,
+        cache: Any,
         scale: float,
-        mask: Optional[mx.array],
-        sinks: Optional[mx.array] = None,
+        mask: mx.array | str | None,
+        sinks: mx.array | None = None,
     ) -> mx.array:
         from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
+        from mlx_vlm.turboquant import _state_length
 
-        from ..turboquant_kv import BatchTurboQuantKVCache, _state_length
+        from ..turboquant_kv import BatchTurboQuantKVCache
 
         # Detect underlying TQ cache (may be wrapped by proxy objects)
         real_cache = cache
@@ -606,7 +629,7 @@ def apply_turboquant_attention_patch() -> bool:
                         "falling back to prefill paths",
                         exc_info=True,
                     )
-            # Prefill: try quantized fast path, fallback to dequantize+SDPA
+            # Prefill: use bounded quantized attention for long cache states.
             result = real_cache.prefill_attention(
                 queries,
                 keys_state=keys,
@@ -621,20 +644,17 @@ def apply_turboquant_attention_patch() -> bool:
                 total_tokens = _state_length(keys_state)
             except Exception:
                 total_tokens = 0
-            if (
-                total_tokens > _LONG_PREFILL_QUANTIZED_THRESHOLD
-                and hasattr(real_cache, "quantized_attention")
-            ):
+            if total_tokens > _LONG_PREFILL_QUANTIZED_THRESHOLD:
+                if not hasattr(real_cache, "quantized_attention"):
+                    raise RuntimeError(
+                        "Long TurboQuant prefill requires quantized attention"
+                    )
                 old_query_block_size = getattr(
                     real_cache, "prefill_query_block_size", None
                 )
-                old_key_chunk_size = getattr(
-                    real_cache, "prefill_key_chunk_size", None
-                )
+                old_key_chunk_size = getattr(real_cache, "prefill_key_chunk_size", None)
                 try:
-                    real_cache.prefill_query_block_size = (
-                        _LONG_PREFILL_QUERY_BLOCK_SIZE
-                    )
+                    real_cache.prefill_query_block_size = _LONG_PREFILL_QUERY_BLOCK_SIZE
                     real_cache.prefill_key_chunk_size = _LONG_PREFILL_KEY_CHUNK_SIZE
                     return real_cache.quantized_attention(
                         queries,
@@ -642,12 +662,6 @@ def apply_turboquant_attention_patch() -> bool:
                         values_state=values,
                         scale=scale,
                         mask=mask,
-                    )
-                except Exception:
-                    logger.debug(
-                        "TurboQuant quantized prefill attention failed; "
-                        "falling back to dequantize+SDPA",
-                        exc_info=True,
                     )
                 finally:
                     if old_query_block_size is not None:
@@ -671,10 +685,14 @@ def apply_turboquant_attention_patch() -> bool:
     # Also patch any model modules that already imported it locally
     # Covers both mlx_lm (LLM) and mlx_vlm (VLM) model modules
     import sys
+
     for mod_name, mod in list(sys.modules.items()):
         if mod is None:
             continue
-        if not (mod_name.startswith("mlx_lm.models.") or mod_name.startswith("mlx_vlm.models.")):
+        if not (
+            mod_name.startswith("mlx_lm.models.")
+            or mod_name.startswith("mlx_vlm.models.")
+        ):
             continue
         if hasattr(mod, "scaled_dot_product_attention"):
             func = getattr(mod, "scaled_dot_product_attention")
@@ -684,6 +702,7 @@ def apply_turboquant_attention_patch() -> bool:
     # Also patch mlx_vlm.models.base if loaded
     try:
         from mlx_vlm.models import base as vlm_base
+
         if hasattr(vlm_base, "scaled_dot_product_attention"):
             vlm_base.scaled_dot_product_attention = patched_sdpa
     except ImportError:

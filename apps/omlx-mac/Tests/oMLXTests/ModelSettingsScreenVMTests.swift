@@ -60,6 +60,26 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertFalse(values.contains("model-MTPLX-runtime"))
     }
 
+    func testDisablingTurboQuantClearsMidPrefill() {
+        let vm = ModelSettingsScreenVM()
+        vm.turboquantKvEnabled = true
+        vm.turboquantMidPrefill = true
+
+        vm.turboquantKvEnabled = false
+
+        XCTAssertFalse(vm.turboquantMidPrefill)
+    }
+
+    func testEnablingDFlashClearsMidPrefill() {
+        let vm = ModelSettingsScreenVM()
+        vm.turboquantKvEnabled = true
+        vm.turboquantMidPrefill = true
+
+        vm.dflashEnabled = true
+
+        XCTAssertFalse(vm.turboquantMidPrefill)
+    }
+
     private func makeModel(id: String, configModelType: String?) -> ModelDTO {
         ModelDTO(
             id: id,

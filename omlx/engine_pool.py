@@ -44,6 +44,7 @@ from .exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
     ModelUnavailableError,
+    TurboQuantProcessExclusiveError,
     describe_ceiling_binding,
 )
 from .model_discovery import discover_models, format_size
@@ -334,6 +335,10 @@ class EnginePool:
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
         if turboquant_active:
+            add(
+                "turboquant_mid_prefill",
+                bool(data.get("turboquant_mid_prefill", False)),
+            )
             add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
             add("turboquant_skip_last", data.get("turboquant_skip_last", True))
 
@@ -818,6 +823,14 @@ class EnginePool:
             entry = self._entries.get(model_id)
             if not entry:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
+            try:
+                self._raise_if_other_mid_prefill_model_owns_process(model_id)
+            except TurboQuantProcessExclusiveError as exc:
+                raise ModelLoadingError(
+                    model_id,
+                    f"Model '{model_id}' cannot load while process-exclusive "
+                    f"Metal access is unavailable: {exc}",
+                ) from exc
             expected_signature = self._engine_runtime_signature(
                 model_id,
                 runtime_settings,
@@ -1200,6 +1213,53 @@ class EnginePool:
         except AttributeError:
             return None
 
+    def _raise_if_other_mid_prefill_model_owns_process(
+        self,
+        model_id: str,
+    ) -> None:
+        for other_id, entry in self._entries.items():
+            if other_id == model_id or entry.engine is None:
+                continue
+            scheduler = self._resolve_scheduler_from_engine(entry.engine)
+            if (
+                scheduler is not None
+                and getattr(scheduler, "_turboquant_mid_prefill", False) is True
+            ):
+                raise TurboQuantProcessExclusiveError(
+                    "TurboQuant mid-prefill requires process-exclusive Metal "
+                    f"access; unload '{other_id}' before loading '{model_id}'"
+                )
+
+    async def _claim_turboquant_mid_prefill_process(
+        self,
+        model_id: str,
+        scheduler: object,
+    ) -> None:
+        other_ids = [
+            other_id
+            for other_id, entry in self._entries.items()
+            if other_id != model_id and entry.engine is not None
+        ]
+        if other_ids:
+            raise TurboQuantProcessExclusiveError(
+                "TurboQuant mid-prefill requires process-exclusive Metal "
+                "access; unload all other engines before enabling it "
+                f"(loaded: {', '.join(sorted(other_ids))})"
+            )
+
+        process_owner = getattr(scheduler, "_metal_process_owner", None)
+        claim_process = getattr(
+            process_owner,
+            "claim_turboquant_mid_prefill_process",
+            None,
+        )
+        if not callable(claim_process):
+            raise RuntimeError(
+                "TurboQuant mid-prefill requires an EngineCore-owned "
+                "process-exclusive Metal lane"
+            )
+        await claim_process()
+
     def _is_idle_for_prefill_eviction(self, entry: EngineEntry) -> bool:
         engine = entry.engine
         if engine is None or entry.is_pinned or entry.is_loading or entry.in_use > 0:
@@ -1429,11 +1489,28 @@ class EnginePool:
 
         logger.info(f"Unloading model: {model_id} (immediate abort)")
         pre_unload_active = mx.get_active_memory()
+        scheduler = self._resolve_scheduler_from_engine(entry.engine)
+        process_owner = (
+            getattr(scheduler, "_metal_process_owner", None)
+            if scheduler is not None
+            else None
+        )
 
         try:
             await entry.engine.stop()
-        except Exception as e:
-            logger.warning(f"Error stopping engine for {model_id}: {e}")
+        except Exception as exc:
+            logger.warning("Error stopping engine for %s: %s", model_id, exc)
+        finally:
+            close_process_owner = getattr(process_owner, "close", None)
+            if callable(close_process_owner):
+                try:
+                    close_process_owner()
+                except Exception:
+                    logger.warning(
+                        "Error closing engine owner for %s",
+                        model_id,
+                        exc_info=True,
+                    )
 
         # #1595: the immediate-abort stop() above tears the engine down without the normal
         # per-request completion callbacks, so a non-streaming engine's active_requests
@@ -1677,6 +1754,15 @@ class EnginePool:
             model_settings = runtime_settings
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
+            if (
+                model_settings is not None
+                and getattr(model_settings, "dflash_enabled", False)
+                and getattr(model_settings, "turboquant_kv_enabled", False)
+                and getattr(model_settings, "turboquant_mid_prefill", False)
+            ):
+                raise TurboQuantProcessExclusiveError(
+                    "TurboQuant mid-prefill cannot be enabled with DFlash"
+                )
 
             # Wire the correct model_id / model_path into the shared scheduler
             # config so every engine (Batched/VLM/DFlash/Embedding) sees the
@@ -2069,6 +2155,49 @@ class EnginePool:
                     "the request.",
                 )
 
+            scheduler = self._resolve_scheduler_from_engine(engine)
+            if (
+                scheduler is not None
+                and getattr(scheduler, "_turboquant_mid_prefill", False) is True
+            ):
+                process_owner = getattr(
+                    scheduler,
+                    "_metal_process_owner",
+                    None,
+                )
+                try:
+                    await self._claim_turboquant_mid_prefill_process(
+                        model_id,
+                        scheduler,
+                    )
+                except Exception:
+                    entry.engine = None
+                    self._current_model_memory = max(
+                        0,
+                        self._current_model_memory - entry.estimated_size,
+                    )
+                    load_completed = False
+                    try:
+                        await engine.stop()
+                    except Exception:
+                        logger.warning(
+                            "Failed to stop non-exclusive mid-prefill engine %s",
+                            model_id,
+                            exc_info=True,
+                        )
+                    finally:
+                        close_process_owner = getattr(process_owner, "close", None)
+                        if callable(close_process_owner):
+                            try:
+                                close_process_owner()
+                            except Exception:
+                                logger.warning(
+                                    "Failed to close non-exclusive mid-prefill "
+                                    "owner for %s",
+                                    model_id,
+                                    exc_info=True,
+                                )
+                    raise
             logger.info(
                 f"Loaded model: {model_id} "
                 f"(actual: {format_size(entry.actual_size)}, "
@@ -2086,6 +2215,12 @@ class EnginePool:
             # inflated and the memory-ceiling admission check rejects all
             # subsequent loads until a server restart.
             self._schedule_failed_load_reclaim(model_id, pre_load_memory)
+            if isinstance(exc, TurboQuantProcessExclusiveError):
+                raise ModelLoadingError(
+                    model_id,
+                    f"Model '{model_id}' cannot load while process-exclusive "
+                    f"Metal access is unavailable: {exc}",
+                ) from exc
             if not entry.abort_loading and not entry_detached:
                 self._mark_load_failure(entry, exc)
                 logger.exception(

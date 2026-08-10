@@ -2865,6 +2865,34 @@ class TestSchedulerBoundarySnapshots:
         assert scheduler._boundary_snapshot_required is True
         assert mock_model._omlx_mtp_commit_align == 4
 
+    def test_prefill_snapshot_policy_failure_does_not_fall_back_to_memory(
+        self,
+        mock_model,
+        mock_tokenizer,
+    ):
+        from omlx.cache.paged_ssd_cache import DarwinNoCacheError
+
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_store = MagicMock()
+        scheduler._boundary_snapshot_store.save.side_effect = DarwinNoCacheError(
+            "F_NOCACHE rejected"
+        )
+        RotatingStub = type("RotatingKVCache", (), {})
+
+        with pytest.raises(DarwinNoCacheError, match="F_NOCACHE rejected"):
+            scheduler._on_prefill_boundary_snapshot(
+                "req-policy-failure",
+                [RotatingStub()],
+                4,
+            )
+
+        assert scheduler._boundary_cache_snapshots["req-policy-failure"] == {}
+
     def test_prefill_boundary_snapshot_ignores_non_boundary_token_count(
         self, mock_model, mock_tokenizer
     ):
