@@ -411,7 +411,7 @@ class BaseEngine(ABC):
         messages: list,
         tools: Optional[list] = None,
         request_id: Optional[str] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> bool | None:
         """Optional prefill-memory preflight check for chat requests.
 
@@ -431,7 +431,7 @@ class BaseEngine(ABC):
         self,
         prompt: str,
         request_id: Optional[str] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> bool | None:
         """Optional prefill-memory preflight check for completion requests.
 

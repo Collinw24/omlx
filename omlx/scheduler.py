@@ -412,7 +412,7 @@ logger = logging.getLogger(__name__)
 class _PrefillAbortedError(Exception):
     """Raised when prefill is interrupted by a pending abort."""
 
-    def __init__(self, aborted_uids: list[int], processed_tokens: int):
+    def __init__(self, aborted_uids: list[int], processed_tokens: int) -> None:
         self.aborted_uids = aborted_uids
         self.processed_tokens = processed_tokens
         super().__init__(
@@ -1697,7 +1697,7 @@ class Scheduler:
         tokenizer: Any,
         config: SchedulerConfig | None = None,
         stream: Any | None = None,
-    ):
+    ) -> None:
         """
         Initialize the scheduler.
 

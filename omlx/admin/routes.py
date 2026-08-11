@@ -34,7 +34,7 @@ from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
 from ..model_profiles import EXCLUDED_FROM_PROFILES
-from ..model_settings import merge_chat_template_kwargs
+from ..model_settings import ModelSettings, merge_chat_template_kwargs
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from ..websearch import DDGS_TEXT_BACKENDS, run_web_search_test
@@ -560,7 +560,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         settings["forced_ct_kwargs"] = filtered_forced or None
 
 
-def _sanitize_diffusion_model_settings(settings) -> None:
+def _sanitize_diffusion_model_settings(settings: ModelSettings) -> None:
     """Clear settings that the serial diffusion lane does not implement.
 
     ``max_tool_result_tokens`` is intentionally preserved — tool calling
@@ -2128,7 +2128,7 @@ async def update_model_settings(
     model_id: str,
     request: ModelSettingsRequest,
     is_admin: bool = Depends(require_admin),
-):
+) -> dict[str, Any]:
     """
     Update settings for a specific model.
 

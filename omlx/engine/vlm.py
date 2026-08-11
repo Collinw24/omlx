@@ -3067,7 +3067,7 @@ class VLMBatchedEngine(BaseEngine):
         vlm_image_hash: str | None = None,
         vlm_cache_key_start: int = 0,
         vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> GenerationOutput:
         """Generate a complete response (non-streaming)."""
         if not self._loaded:
@@ -3175,7 +3175,7 @@ class VLMBatchedEngine(BaseEngine):
         vlm_image_hash: str | None = None,
         vlm_cache_key_start: int = 0,
         vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> AsyncIterator[GenerationOutput]:
         """Stream generation token by token."""
         if not self._loaded:
@@ -3374,7 +3374,7 @@ class VLMBatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         request_id: str | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> bool:
         """Early prefill memory check for chat completions (VLM path).
 
@@ -3481,7 +3481,7 @@ class VLMBatchedEngine(BaseEngine):
         self,
         prompt: str,
         request_id: str | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> bool:
         """Early prefill memory check for plain /v1/completions calls (VLM).
 

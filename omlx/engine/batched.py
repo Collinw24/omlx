@@ -705,7 +705,7 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> GenerationOutput:
         """
         Generate a complete response (non-streaming).
@@ -786,7 +786,7 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> AsyncIterator[GenerationOutput]:
         """
         Stream generation token by token.
@@ -959,7 +959,7 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         request_id: str | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> bool | None:
         """Early prefill memory check for chat completions.
 
@@ -1017,7 +1017,7 @@ class BatchedEngine(BaseEngine):
         self,
         prompt: str,
         request_id: str | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> bool | None:
         """Early prefill memory check for plain /v1/completions calls.
 

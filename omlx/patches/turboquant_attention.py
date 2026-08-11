@@ -15,7 +15,7 @@ When TurboQuantKVCache is detected, routes attention to:
 
 import logging
 from functools import cache
-from typing import Optional
+from typing import Any, Optional
 
 import mlx.core as mx
 from ..turboquant_kv import (
@@ -544,10 +544,10 @@ def apply_turboquant_attention_patch() -> bool:
     original_sdpa = mlx_base.scaled_dot_product_attention
 
     def patched_sdpa(
-        queries,
-        keys,
-        values,
-        cache,
+        queries: mx.array,
+        keys: Any,
+        values: Any,
+        cache: Any,
         scale: float,
         mask: Optional[mx.array],
         sinks: Optional[mx.array] = None,

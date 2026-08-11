@@ -223,7 +223,7 @@ class EngineCore:
         config: Optional[EngineConfig] = None,
         engine_id: Optional[str] = None,
         force_model_ownership: bool = True,
-    ):
+    ) -> None:
         """
         Initialize the engine.
 

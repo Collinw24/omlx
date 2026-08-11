@@ -3215,7 +3215,7 @@ async def create_chat_completion(
     request: ChatCompletionRequest,
     http_request: FastAPIRequest,
     _: bool = Depends(verify_api_key),
-):
+) -> StreamingResponse:
     """
     Create a chat completion.
 
@@ -5220,7 +5220,7 @@ async def create_anthropic_message(
     request: AnthropicMessagesRequest,
     http_request: FastAPIRequest,
     _: bool = Depends(verify_api_key),
-):
+) -> StreamingResponse:
     """
     Create a message using Anthropic Messages API format.
 
@@ -5732,7 +5732,7 @@ async def create_response(
     request: ResponsesRequest,
     http_request: FastAPIRequest,
     _: bool = Depends(verify_api_key),
-):
+) -> StreamingResponse:
     """Create a response (OpenAI Responses API)."""
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(

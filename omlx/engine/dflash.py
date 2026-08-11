@@ -307,7 +307,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         omlx_ssd_cache_dir: str | Path | None = None,
         prefill_eviction_callback: Any | None = None,
         mid_prefill_process_claim_callback: Any | None = None,
-    ):
+    ) -> None:
         super().__init__()
         self._model_name = model_name
         self._draft_model_path = draft_model_path
@@ -984,7 +984,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         messages: list,
         tools: list | None = None,
         request_id: str | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> bool | None:
         """Prefill-memory preflight for chat requests.
 
@@ -1034,7 +1034,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self,
         prompt: str,
         request_id: str | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> bool | None:
         """Prefill-memory preflight for plain completions. See ``preflight_chat``."""
         if not self._loaded:
