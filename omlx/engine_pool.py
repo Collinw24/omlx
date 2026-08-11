@@ -2082,6 +2082,7 @@ class EnginePool:
                 )
 
             self._validate_llm_engine_ready(model_id, engine)
+            assert engine is not None
             entry.engine = engine
             entry.last_access = time.time()
             self._current_model_memory += entry.estimated_size
