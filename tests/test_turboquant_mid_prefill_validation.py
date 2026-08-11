@@ -71,6 +71,52 @@ def test_mode_expansion_is_exact_and_ordered() -> None:
     ]
 
 
+def test_direct_loader_releases_transient_buffers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A matrix cell clears unused loader buffers before supervised prefill."""
+    from omlx.utils import model_loading, tokenizer
+
+    events: list[str] = []
+    model = object()
+    loaded_tokenizer = object()
+    monkeypatch.setattr(
+        model_loading,
+        "maybe_apply_pre_load_patches",
+        lambda *_args, **_kwargs: events.append("pre"),
+    )
+    monkeypatch.setattr(
+        tokenizer,
+        "get_tokenizer_config",
+        lambda *_args, **_kwargs: {"local_files_only": True},
+    )
+    monkeypatch.setattr(
+        model_loading,
+        "lm_load_compat",
+        lambda *_args, **_kwargs: (model, loaded_tokenizer),
+    )
+    monkeypatch.setattr(
+        model_loading,
+        "apply_post_load_transforms",
+        lambda loaded, _settings: events.append("transform") or loaded,
+    )
+    monkeypatch.setattr(
+        model_loading,
+        "materialize_lazy_state",
+        lambda loaded: events.append("materialize") if loaded is model else None,
+    )
+    monkeypatch.setattr(validation.gc, "collect", lambda: events.append("gc"))
+    monkeypatch.setattr(mx, "synchronize", lambda: events.append("synchronize"))
+    monkeypatch.setattr(mx, "clear_cache", lambda: events.append("clear"))
+
+    result = validation._load_direct_model(
+        "/model",
+        validation.ValidationMode("dense", "dense", None),
+        False,
+    )
+
+    assert result == (model, loaded_tokenizer)
+    assert events == ["pre", "transform", "materialize", "gc", "synchronize", "clear"]
+
+
 def test_pinned_dataset_selection_and_cell_configuration() -> None:
     """Dataset provenance, rows, and primary performance cells stay pinned."""
     config = validation.pinned_dataset_config()
