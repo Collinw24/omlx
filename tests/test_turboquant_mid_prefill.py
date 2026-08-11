@@ -24,7 +24,6 @@ from omlx.scheduler import (
     Scheduler,
     SchedulerConfig,
     _PrefillAbortedError,
-    _PrefillEvictionNeeded,
     _PrefillKVPhase,
 )
 from omlx.turboquant_kv import (
@@ -925,35 +924,17 @@ def test_conversion_safety_cap_at_or_above_boundary_enters_converter(
     assert context.phase is _PrefillKVPhase.TURBOQUANT
 
 
-def test_guard_evicts_once_before_converting() -> None:
+def test_process_exclusive_guard_converts_without_eviction_pause() -> None:
     scheduler = _make_scheduler()
     cap = _configure_pressure(scheduler)
     cache = _dense_cache(tokens=4)
-    request = _make_request("guard", list(range(9)), cache)
+    request = _make_request("exclusive-guard", list(range(9)), cache)
     scheduler.requests[request.request_id] = request
     context = scheduler._new_prefill_context(
         request,
         cache,
         loop_label="external",
     )
-
-    with pytest.raises(_PrefillEvictionNeeded) as exc:
-        scheduler._guard_prefill_chunk(
-            4,
-            kv_len=4,
-            progress=4,
-            loop_label="external",
-            request_id=request.request_id,
-            request=request,
-            prompt_cache=cache,
-            prefill_context=context,
-        )
-    assert exc.value.request.reason == "turboquant_mid_prefill"
-    assert exc.value.request.processed_tokens == 4
-    assert request.prefill_eviction_retries == 1
-    assert context.conversion_attempted is False
-    assert request.turboquant_mid_prefill_attempted is False
-    assert all(isinstance(cache_obj, KVCache) for cache_obj in cache)
 
     result = scheduler._guard_prefill_chunk(
         4,
@@ -965,7 +946,9 @@ def test_guard_evicts_once_before_converting() -> None:
         prompt_cache=cache,
         prefill_context=context,
     )
+
     assert result == 4
+    assert request.prefill_eviction_retries == 0
     assert context.phase is _PrefillKVPhase.TURBOQUANT
     assert request.turboquant_mid_prefill_attempted is True
     assert context.memory_after_bytes < cap
@@ -1043,7 +1026,7 @@ def test_sizing_target_pressure_triggers_conversion_before_abort_cap() -> None:
     assert request.turboquant_mid_prefill_attempted is True
 
 
-def test_organic_pressure_triggers_eviction_pause_then_retry_converts() -> None:
+def test_organic_pressure_avoids_no_victim_restart() -> None:
     scheduler = _make_scheduler(step_size=4)
     cap = _configure_pressure(scheduler)
     cache = _dense_cache(tokens=4)
@@ -1064,35 +1047,8 @@ def test_organic_pressure_triggers_eviction_pause_then_retry_converts() -> None:
     )
     assert candidate == 4
 
-    with pytest.raises(_PrefillEvictionNeeded) as exc:
-        scheduler._guard_prefill_chunk(
-            candidate,
-            kv_len=4,
-            progress=4,
-            loop_label="external",
-            request_id=request.request_id,
-            request=request,
-            prompt_cache=cache,
-            prefill_context=context,
-        )
-
-    assert exc.value.request.reason == "turboquant_mid_prefill"
-    assert request.prefill_eviction_retries == 1
-    assert context.conversion_attempted is False
-    assert request.turboquant_mid_prefill_attempted is False
-    assert all(isinstance(cache_obj, KVCache) for cache_obj in cache)
-
-    retry_candidate = scheduler._adaptive_chunk_size(
-        4,
-        request_id=request.request_id,
-        loop_label="external",
-        kv_len=4,
-        prefill_context=context,
-    )
-    assert retry_candidate == 4
-
     result = scheduler._guard_prefill_chunk(
-        retry_candidate,
+        candidate,
         kv_len=4,
         progress=4,
         loop_label="external",
@@ -1103,6 +1059,7 @@ def test_organic_pressure_triggers_eviction_pause_then_retry_converts() -> None:
     )
 
     assert result == 4
+    assert request.prefill_eviction_retries == 0
     assert context.phase is _PrefillKVPhase.TURBOQUANT
     assert context.trigger_tokens == 4
     assert request.turboquant_mid_prefill_attempted is True

@@ -4527,6 +4527,13 @@ class Scheduler:
         request = self.requests.get(request_id)
         if request is None:
             return
+        # Process-exclusive ownership proves there cannot be another loaded
+        # engine to evict. Convert in this request instead of paying an
+        # asynchronous pause/requeue that cannot free a victim.
+        if _conversion_coordinator.process_exclusive(
+            getattr(self, "_metal_process_owner", None)
+        ):
+            return
         if getattr(self, "_prefill_eviction_callback_configured", None) is False:
             return
         max_retries = getattr(
@@ -9282,6 +9289,12 @@ class Scheduler:
         """
         while self._pending_abort_ids:
             request_id = self._pending_abort_ids.pop()
+            pending_eviction = self._pending_prefill_eviction_request
+            if (
+                pending_eviction is not None
+                and pending_eviction.request_id == request_id
+            ):
+                self._pending_prefill_eviction_request = None
             self._do_abort_request(request_id)
 
     def _cleanup_prefill_abort_request(

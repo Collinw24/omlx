@@ -15,7 +15,7 @@ Note: Uses pytest-asyncio for async tests.
 import asyncio
 import concurrent.futures
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -28,7 +28,7 @@ from omlx.engine_core import (
 from omlx.exceptions import PrefillMemoryAbortedError, PrefillMemoryExceededError
 from omlx.output_collector import RequestOutputCollector
 from omlx.request import RequestOutput, SamplingParams
-from omlx.scheduler import SchedulerConfig, SchedulerOutput
+from omlx.scheduler import PrefillEvictionRequest, SchedulerConfig, SchedulerOutput
 
 
 class TestEngineConfig:
@@ -313,6 +313,55 @@ class TestEngineCoreStartStop:
                     await asyncio.sleep(0.01)
 
                 assert engine.scheduler.step.call_count > calls_before
+            finally:
+                await engine.stop()
+                engine.close()
+
+
+    @pytest.mark.asyncio
+    async def test_no_victim_callback_resumes_paused_request(
+        self,
+        mock_model: MagicMock,
+        mock_tokenizer: MagicMock,
+    ) -> None:
+        callback = AsyncMock(return_value=False)
+        config = EngineConfig(
+            step_interval=10.0,
+            prefill_eviction_callback=callback,
+        )
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(
+                model=mock_model,
+                tokenizer=mock_tokenizer,
+                config=config,
+            )
+            eviction = PrefillEvictionRequest(
+                request_id="paused-request",
+                model_id="model",
+                current_bytes=10,
+                target_cap_bytes=8,
+                predicted_transient_bytes=4,
+                requested_tokens=4,
+                reason="prefill_preflight",
+            )
+            first = SchedulerOutput(
+                has_work=True,
+                prefill_eviction_request=eviction,
+            )
+            second = SchedulerOutput(has_work=False)
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+            engine._step_burst = MagicMock(side_effect=[[first], [second]])
+
+            try:
+                await engine.start()
+                for _ in range(100):
+                    if engine._step_burst.call_count >= 2:
+                        break
+                    await asyncio.sleep(0.01)
+
+                callback.assert_awaited_once_with(eviction)
+                assert engine._step_burst.call_count == 2
             finally:
                 await engine.stop()
                 engine.close()

@@ -1147,6 +1147,38 @@ class TestSchedulerAbortRequest:
         assert request not in scheduler.waiting
         assert "test-001" in scheduler.finished_req_ids
 
+    def test_abort_paused_prefill_clears_eviction_handoff(
+        self,
+        mock_model: MagicMock,
+        mock_tokenizer: MagicMock,
+    ) -> None:
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="paused-prefill",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests[request.request_id] = request
+        eviction = PrefillEvictionRequest(
+            request_id=request.request_id,
+            model_id="model",
+            current_bytes=10,
+            target_cap_bytes=8,
+            predicted_transient_bytes=4,
+            requested_tokens=4,
+            reason="prefill_preflight",
+        )
+        scheduler._pause_for_prefill_eviction(request, eviction)
+
+        scheduler.abort_request(request.request_id)
+        scheduler._process_pending_aborts()
+
+        assert scheduler._pending_prefill_eviction_request is None
+        assert request.status == RequestStatus.FINISHED_ABORTED
+        assert request not in scheduler.waiting
+        assert request.request_id in scheduler.finished_req_ids
+
+
     def test_abort_active_specprefill_restores_rope(self, mock_model, mock_tokenizer):
         """Aborting the active specprefill request restores RoPE (#766).
 
