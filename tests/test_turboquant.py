@@ -460,7 +460,7 @@ def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(monkeypat
         self, queries, keys_state=None, values_state=None, scale=1.0, mask=None
     ):
         calls.append((keys_state, values_state, self.prefill_query_block_size))
-        assert self.prefill_key_chunk_size == 16384
+        assert self.prefill_key_chunk_size == 4096
         return mx.zeros_like(queries)
 
     monkeypatch.setattr(
@@ -484,7 +484,7 @@ def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(monkeypat
     assert len(calls) == 1
     assert calls[0][0] is ks
     assert calls[0][1] is vs
-    assert calls[0][2] == 256
+    assert calls[0][2] == 512
 
 
 def test_attention_patch_executes_real_q8_multi_token_quantized_suffix(
@@ -552,8 +552,8 @@ def test_attention_patch_executes_real_q8_multi_token_quantized_suffix(
     assert out.shape == queries.shape
     assert mx.all(mx.isfinite(out)).item()
     assert prefill_results == [None]
-    assert quantized_blocks == [(256, 16384)]
-    assert unpack_calls == [(8, 32), (8, 32)]
+    assert quantized_blocks == [(512, 4096)]
+    assert unpack_calls == [(8, 32)] * 6
     assert tq.prefill_query_block_size == original_query_block
     assert tq.prefill_key_chunk_size == original_key_chunk
 
