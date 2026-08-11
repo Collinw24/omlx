@@ -1787,6 +1787,7 @@ class Scheduler:
         self._turboquant_kv_bits: float | None = None
         self._turboquant_skip_last: bool = True
         self._turboquant_mid_prefill: bool = False
+        self._metal_process_owner: Any | None = None
         self._prefill_dense_kv_dtype_size: float | None = None
         self._prefill_tq_kv_dtype_size: float | None = None
         # Route-level preflight can only defer a dense-memory rejection when
@@ -3493,6 +3494,8 @@ class Scheduler:
         last_kv_idx = kv_indices[-1] if skip_last else -1
 
         converted = 0
+        if self._turboquant_kv_bits is None:
+            raise RuntimeError("TurboQuant KV bits are not configured")
         bits = float(self._turboquant_kv_bits)
         for i, cache_obj in enumerate(prompt_cache):
             if isinstance(cache_obj, KVCache):
@@ -3530,6 +3533,8 @@ class Scheduler:
         last_kv_index = kv_indices[-1] if skip_last else -1
 
         converted = 0
+        if self._turboquant_kv_bits is None:
+            raise RuntimeError("TurboQuant KV bits are not configured")
         bits = float(self._turboquant_kv_bits)
         for index, cache_obj in enumerate(prompt_cache):
             if isinstance(cache_obj, KVCache):
@@ -4418,8 +4423,10 @@ class Scheduler:
             if tracker.bytes_per_token > 0:
                 per_token = max(per_token, tracker.bytes_per_token)
         if self.memory_monitor is not None:
-            static = self.memory_monitor.estimate_chunk_transient_bytes(
-                n_tokens, kv_len + n_tokens
+            static = float(
+                self.memory_monitor.estimate_chunk_transient_bytes(
+                    n_tokens, kv_len + n_tokens
+                )
             )
             if phase is _PrefillKVPhase.TURBOQUANT:
                 raw_bits = getattr(self, "_turboquant_kv_bits", None)
@@ -5142,7 +5149,7 @@ class Scheduler:
         else:
             hot_cache_bytes = Scheduler._hot_cache_cpu_bytes(self)
         phys = max(0, int(get_phys_footprint()) - hot_cache_bytes)
-        return max(active, phys) + _conversion_coordinator.outstanding_bytes()
+        return int(max(active, phys) + _conversion_coordinator.outstanding_bytes())
 
     def get_active_hot_cache_block_hashes(self) -> set[bytes]:
         """Return hot-cache block hashes owned by active in-flight requests."""
@@ -12959,7 +12966,7 @@ class Scheduler:
         except Exception:
             cache_factory = None
         cache_factory_available = callable(cache_factory)
-        if cache_factory_available:
+        if callable(cache_factory):
             try:
                 cache_candidate = cache_factory()
             except Exception:
