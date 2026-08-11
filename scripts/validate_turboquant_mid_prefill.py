@@ -1080,6 +1080,8 @@ def _load_direct_model(
     model_path: str, mode: ValidationMode, trust: bool
 ) -> tuple[Any, Any]:
     """Load one direct-loop model with production compatibility transforms."""
+    import mlx.core as mx
+
     from omlx.model_settings import ModelSettings
     from omlx.utils.model_loading import (
         apply_post_load_transforms,
@@ -1105,6 +1107,13 @@ def _load_direct_model(
     )
     model = apply_post_load_transforms(model, settings)
     materialize_lazy_state(model)
+    # Match the production EnginePool handoff: source loading and lazy
+    # materialization can leave unreferenced Metal buffers in the allocator
+    # pool. Release them before the supervised prefill starts so the 6 GiB
+    # host floor measures the model request, not loader residue.
+    gc.collect()
+    mx.synchronize()
+    mx.clear_cache()
     if mode.bits is not None:
         from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
 
