@@ -15,7 +15,6 @@ import logging
 import math
 import os
 import platform
-import re
 import statistics
 import subprocess
 import sys
@@ -48,8 +47,6 @@ SCHEMA_VERSION = 1
 GIB = 1024**3
 TELEMETRY_EXIT_GRACE_SECONDS = 1.0
 _FORCE_ENV_PREFIX = "OMLX_FORCE_"
-_MEMORY_TOTAL_RE = re.compile(r"The system has\s+(\d+)\s+\(")
-_MEMORY_FREE_RE = re.compile(r"System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%")
 _T = TypeVar("_T")
 
 
@@ -71,11 +68,12 @@ class ValidationMode:
 
 
 @dataclass(frozen=True, slots=True)
-class MemoryPressureReading:
-    """Parsed kernel memory-pressure reading."""
+class HostMemoryReading:
+    """Supported macOS host-memory counters and conservative headroom."""
 
-    total_bytes: int
-    free_percent: float
+    free_bytes: int
+    inactive_bytes: int
+    active_bytes: int
     headroom_bytes: int
 
 
@@ -151,20 +149,23 @@ def official_retrieval_score(response: str, answer: str, prefix: str) -> float:
     return float(SequenceMatcher(None, sampled, expected).ratio())
 
 
-def parse_memory_pressure_output(output: str) -> MemoryPressureReading:
-    """Parse ``memory_pressure -Q`` output or fail closed."""
-    total_match = _MEMORY_TOTAL_RE.search(output)
-    free_match = _MEMORY_FREE_RE.search(output)
-    if total_match is None or free_match is None:
-        raise TelemetryError("memory_pressure output omitted required fields")
-    total_bytes = int(total_match.group(1))
-    free_percent = float(free_match.group(1))
-    if total_bytes <= 0:
-        raise TelemetryError("memory_pressure reported a non-positive total")
-    if not math.isfinite(free_percent) or not 0.0 <= free_percent <= 100.0:
-        raise TelemetryError("memory_pressure reported an invalid free percentage")
-    headroom_bytes = int(total_bytes * free_percent / 100.0)
-    return MemoryPressureReading(total_bytes, free_percent, headroom_bytes)
+def host_memory_reading(stats: Mapping[str, Any]) -> HostMemoryReading:
+    """Build conservative headroom from supported host VM counters."""
+    values = tuple(stats.get(name) for name in ("free", "inactive", "active"))
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in values
+    ):
+        raise TelemetryError(
+            "host_statistics64 omitted valid free, inactive, or active bytes"
+        )
+    free_bytes, inactive_bytes, active_bytes = values
+    return HostMemoryReading(
+        free_bytes=free_bytes,
+        inactive_bytes=inactive_bytes,
+        active_bytes=active_bytes,
+        headroom_bytes=free_bytes + inactive_bytes,
+    )
 
 
 def safety_violation(
@@ -605,23 +606,17 @@ def fetch_mrcr_rows(
     return selected
 
 
-def probe_memory_pressure() -> MemoryPressureReading:
-    """Run the mandatory kernel memory-pressure probe."""
+def probe_host_memory() -> HostMemoryReading:
+    """Read supported host_statistics64 counters or fail closed."""
+    from omlx.utils.psutil_compat import get_macos_vm_stats
+
     try:
-        completed = subprocess.run(
-            ("/usr/bin/memory_pressure", "-Q"),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise TelemetryError(f"memory_pressure probe failed: {exc}") from exc
-    if completed.returncode != 0:
-        raise TelemetryError(
-            f"memory_pressure exited with status {completed.returncode}"
-        )
-    return parse_memory_pressure_output(completed.stdout)
+        stats = get_macos_vm_stats()
+    except Exception as exc:
+        raise TelemetryError(f"host_statistics64 probe failed: {exc}") from exc
+    if stats is None:
+        raise TelemetryError("host_statistics64 returned no valid data")
+    return host_memory_reading(stats)
 
 
 def probe_child_footprint(pid: int) -> int:
@@ -677,7 +672,7 @@ def supervise_child(
                 break
             try:
                 child_phys = probe_child_footprint(process.pid)
-                pressure = probe_memory_pressure()
+                pressure = probe_host_memory()
                 samples += 1
                 peak_child = max(peak_child, child_phys)
                 minimum_headroom = (
@@ -736,6 +731,7 @@ def supervise_child(
             "samples": samples,
             "peak_child_phys_footprint_bytes": peak_child,
             "minimum_host_headroom_bytes": minimum_headroom,
+            "host_headroom_metric": "host_statistics64.free+inactive",
             "child_limit_bytes": child_limit_bytes,
             "host_minimum_bytes": host_minimum_bytes,
             "poll_interval_seconds": poll_interval_seconds,
