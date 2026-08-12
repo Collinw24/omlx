@@ -773,6 +773,9 @@ def test_organic_contract_uses_natural_fixed_prompt_without_force_controls() -> 
     assert config["prefill_min_chunk_tokens"] == 32
     assert not any(key.startswith("OMLX_FORCE_") for key in config)
 
+    assert config["child_memory_limit_bytes"] == 37 * validation.GIB
+    assert config["host_headroom_minimum_bytes"] == 6 * validation.GIB
+
 
 def test_organic_pressure_uses_production_custom_tier_controls() -> None:
     """Manual limits retain custom-tier abort and minimum-chunk controls."""
