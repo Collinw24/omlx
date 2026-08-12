@@ -2048,8 +2048,17 @@ def _validate_cli_arguments(args: argparse.Namespace) -> None:
             raise ValidationError("max prompt tokens must exceed one")
         if args.greedy_token_limit <= 0:
             raise ValidationError("greedy token limit must be positive")
-        if tuple(args.rows) != DEFAULT_MATRIX_ROWS:
-            raise ValidationError("matrix rows are pinned to 104 109 136 301 311 328")
+        rows = tuple(args.rows)
+        if not rows:
+            raise ValidationError("matrix rows must not be empty")
+        if len(set(rows)) != len(rows):
+            raise ValidationError("matrix rows must be unique")
+        unsupported_rows = sorted(set(rows) - set(DEFAULT_MATRIX_ROWS))
+        if unsupported_rows:
+            raise ValidationError(
+                "matrix rows must be selected from pinned rows "
+                "104 109 136 301 311 328"
+            )
     if args.command == "organic":
         if args.scheduler_soft_limit_gib <= 0:
             raise ValidationError("scheduler soft limit must be positive")
