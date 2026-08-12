@@ -188,39 +188,36 @@ def test_official_retrieval_scoring(
     ) == pytest.approx(expected)
 
 
-def test_memory_pressure_parsing_derives_kernel_headroom() -> None:
-    """The supervisor derives bytes from both mandatory -Q fields."""
-    reading = validation.parse_memory_pressure_output(
-        "The system has 51539607552 (3145728 pages with a page size of 16384).\n"
-        "System-wide memory free percentage: 12.5%\n"
+def test_host_memory_reading_uses_free_plus_inactive() -> None:
+    """The supervisor derives headroom from supported host VM counters."""
+    reading = validation.host_memory_reading(
+        {
+            "free": 2 * validation.GIB,
+            "inactive": 4 * validation.GIB,
+            "active": 42 * validation.GIB,
+        }
     )
 
-    assert reading.total_bytes == 51539607552
-    assert reading.free_percent == 12.5
-    assert reading.headroom_bytes == 6442450944
+    assert reading.free_bytes == 2 * validation.GIB
+    assert reading.inactive_bytes == 4 * validation.GIB
+    assert reading.active_bytes == 42 * validation.GIB
+    assert reading.headroom_bytes == 6 * validation.GIB
 
 
 @pytest.mark.parametrize(
-    "output",
+    "stats",
     [
-        "",
-        "The system has 51539607552 bytes.\n",
-        "System-wide memory free percentage: 50%\n",
-        "The system has 0 (0 pages).\nSystem-wide memory free percentage: 50%\n",
-        (
-            "The system has 51539607552 (3145728 pages).\n"
-            "System-wide memory free percentage: 101%\n"
-        ),
-        (
-            "The system has 51539607552 (3145728 pages).\n"
-            "System-wide memory free percentage: nan%\n"
-        ),
+        {},
+        {"free": 1, "inactive": 2},
+        {"free": True, "inactive": 2, "active": 3},
+        {"free": -1, "inactive": 2, "active": 3},
+        {"free": 1, "inactive": "2", "active": 3},
     ],
 )
-def test_memory_pressure_invalid_cases_fail_closed(output: str) -> None:
-    """Missing or invalid kernel telemetry is never interpreted as safe."""
+def test_host_memory_invalid_cases_fail_closed(stats: dict[str, object]) -> None:
+    """Missing or invalid host VM counters are never interpreted as safe."""
     with pytest.raises(validation.TelemetryError):
-        validation.parse_memory_pressure_output(output)
+        validation.host_memory_reading(stats)
 
 
 @pytest.mark.parametrize(
@@ -666,16 +663,17 @@ def test_supervisor_accepts_exit_race_after_valid_telemetry(
         process.exiting = True
         raise validation.TelemetryError("no footprint")
 
-    def _safe_pressure() -> validation.MemoryPressureReading:
-        return validation.MemoryPressureReading(
-            total_bytes=64 * validation.GIB,
-            free_percent=25.0,
+    def _safe_host_memory() -> validation.HostMemoryReading:
+        return validation.HostMemoryReading(
+            free_bytes=8 * validation.GIB,
+            inactive_bytes=8 * validation.GIB,
+            active_bytes=48 * validation.GIB,
             headroom_bytes=16 * validation.GIB,
         )
 
     monkeypatch.setattr(subprocess, "Popen", _popen)
     monkeypatch.setattr(validation, "probe_child_footprint", _racing_probe)
-    monkeypatch.setattr(validation, "probe_memory_pressure", _safe_pressure)
+    monkeypatch.setattr(validation, "probe_host_memory", _safe_host_memory)
     monkeypatch.setattr(validation.time, "sleep", lambda seconds: None)
 
     outcome = validation.supervise_child(
