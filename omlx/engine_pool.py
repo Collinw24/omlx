@@ -2475,7 +2475,7 @@ class EnginePool:
                         model_id,
                         scheduler,
                     )
-                except Exception:
+                except BaseException:
                     entry.engine = None
                     self._current_model_memory = max(
                         0,
@@ -2484,7 +2484,7 @@ class EnginePool:
                     load_completed = False
                     try:
                         await engine.stop()
-                    except Exception:
+                    except BaseException:
                         logger.warning(
                             "Failed to stop non-exclusive mid-prefill engine %s",
                             model_id,
