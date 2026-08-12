@@ -745,6 +745,54 @@ def test_supervisor_interrupt_still_terminates_its_child(
     assert process.terminated is True
 
 
+@pytest.mark.parametrize("row", validation.DEFAULT_MATRIX_ROWS)
+def test_matrix_cli_accepts_single_pinned_row(row: int) -> None:
+    """Final-head spot checks may select one row without weakening provenance."""
+    parser = validation.build_parser()
+    args = parser.parse_args(
+        [
+            "matrix",
+            "--model",
+            "/models/example",
+            "--output",
+            "/tmp/result.json",
+            "--rows",
+            str(row),
+        ]
+    )
+
+    validation._validate_cli_arguments(args)
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [
+        (["104", "104"], "unique"),
+        (["105"], "selected from pinned rows"),
+    ],
+)
+def test_matrix_cli_rejects_unpinned_or_duplicate_rows(
+    rows: list[str],
+    message: str,
+) -> None:
+    """Subset support remains bounded to unique pinned dataset rows."""
+    parser = validation.build_parser()
+    args = parser.parse_args(
+        [
+            "matrix",
+            "--model",
+            "/models/example",
+            "--output",
+            "/tmp/result.json",
+            "--rows",
+            *rows,
+        ]
+    )
+
+    with pytest.raises(validation.ValidationError, match=message):
+        validation._validate_cli_arguments(args)
+
+
 def test_organic_contract_uses_natural_fixed_prompt_without_force_controls() -> None:
     """Organic constants bind to pinned natural row 35 and exact contiguous spans."""
     parser = validation.build_parser()
