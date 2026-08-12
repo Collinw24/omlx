@@ -1956,8 +1956,8 @@ def _add_common_parent_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--child-memory-gib",
         type=float,
-        default=36.0,
-        help="Terminate at this child phys_footprint in GiB (default: 36)",
+        default=37.0,
+        help="Terminate at this child phys_footprint in GiB (default: 37)",
     )
     parser.add_argument(
         "--host-headroom-gib",
