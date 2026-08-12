@@ -417,7 +417,7 @@ class _PrefillAbortedError(Exception):
         self.aborted_uids = aborted_uids
         self.processed_tokens = processed_tokens
         super().__init__(
-            f"Prefill aborted for UIDs {aborted_uids} " f"at {processed_tokens} tokens"
+            f"Prefill aborted for UIDs {aborted_uids} at {processed_tokens} tokens"
         )
 
 
@@ -496,6 +496,7 @@ class PrefillEvictionRequest:
     predicted_transient_bytes: int
     requested_tokens: int
     reason: str
+    processed_tokens: int = 0
 
 
 class _PrefillEvictionNeeded(Exception):
@@ -1201,7 +1202,7 @@ try:
         # Surface which ones so a regression in Llama-4 batching is visible
         # to operators without diffing the patch against installed mlx_lm.
         logger.info(
-            "ChunkedKVCache patch: methods already present upstream, " "skipped: %s",
+            "ChunkedKVCache patch: methods already present upstream, skipped: %s",
             ", ".join(_ckvcache_methods_skipped),
         )
 except ImportError:
@@ -2179,9 +2180,9 @@ class Scheduler:
 
         # Streaming detokenizers for proper UTF-8 handling (one per active request)
         # NOTE: No pooling - each request gets a fresh instance to prevent state contamination
-        self._request_detokenizers: dict[str, Any] = (
-            {}
-        )  # request_id → active detokenizer
+        self._request_detokenizers: dict[
+            str, Any
+        ] = {}  # request_id → active detokenizer
 
         # Protocol-specific output parser support (e.g. Harmony, Gemma 4)
         self._output_parser_factory: OutputParserFactory | None = None
@@ -3387,9 +3388,7 @@ class Scheduler:
         loop_label: str,
     ) -> _PrefillContext:
         """Create request-local phase state and reject partial caches."""
-        mid_prefill_enabled = bool(
-            getattr(self, "_turboquant_mid_prefill", False)
-        )
+        mid_prefill_enabled = bool(getattr(self, "_turboquant_mid_prefill", False))
         if not mid_prefill_enabled and not any(
             _is_turboquant_kv_cache(cache_obj) for cache_obj in prompt_cache
         ):
@@ -3853,10 +3852,7 @@ class Scheduler:
             )
             and phase is _PrefillKVPhase.DENSE
             and conversion_eligible is True
-            and (
-                request is None
-                or not request.turboquant_mid_prefill_attempted
-            )
+            and (request is None or not request.turboquant_mid_prefill_attempted)
         )
 
     def _finalize_turboquant_prefill_cache(
@@ -4266,9 +4262,7 @@ class Scheduler:
                     # band by design — the per-chunk notice is DEBUG there,
                     # not a warning about an unexpected state.
                     _log = (
-                        logger.debug
-                        if self._prefill_speed_priority
-                        else logger.warning
+                        logger.debug if self._prefill_speed_priority else logger.warning
                     )
                     _log(
                         f"Prefill above max_bytes at "
@@ -4595,6 +4589,7 @@ class Scheduler:
         predicted_transient: int,
         requested_tokens: int,
         reason: str,
+        processed_tokens: int = 0,
     ) -> None:
         """Pause a request once so EngineCore can evict idle LRU models."""
         request = self.requests.get(request_id)
@@ -4622,6 +4617,7 @@ class Scheduler:
             predicted_transient_bytes=int(predicted_transient),
             requested_tokens=int(requested_tokens),
             reason=reason,
+            processed_tokens=max(0, int(processed_tokens)),
         )
         logger.info(
             "Request %s needs prefill headroom before throttling "
@@ -4698,6 +4694,7 @@ class Scheduler:
                     predicted_transient=int(full_transient),
                     requested_tokens=n_tokens,
                     reason="turboquant_mid_prefill",
+                    processed_tokens=progress,
                 )
             if (
                 request_obj is not None
@@ -4735,11 +4732,8 @@ class Scheduler:
             # longer eligible, restore ordinary target-based sizing.
             resized = self._adaptive_chunk_size(
                 n_tokens,
-                request_id=request_id or (
-                    prefill_context.request_id
-                    if prefill_context is not None
-                    else ""
-                ),
+                request_id=request_id
+                or (prefill_context.request_id if prefill_context is not None else ""),
                 loop_label=loop_label,
                 kv_len=kv_len,
                 prefill_context=prefill_context,
@@ -5495,6 +5489,18 @@ class Scheduler:
         self._fixed_state_recorded = True
         if total > 0:
             self.memory_monitor.set_fixed_state_bytes(total)
+            manager = getattr(self, "paged_ssd_cache_manager", None)
+            resize_writer_queue = getattr(
+                manager,
+                "set_expected_block_payload_bytes",
+                None,
+            )
+            if callable(resize_writer_queue):
+                block_tokens = max(1, int(self.config.paged_cache_block_size))
+                payload = self.memory_monitor.estimate_paged_writer_block_memory(
+                    block_tokens
+                )
+                resize_writer_queue(math.ceil(payload))
             logger.debug(
                 "Fixed recurrent state measured: %.1fMB per sequence",
                 total / 1024**2,
@@ -5929,11 +5935,7 @@ class Scheduler:
             state.request.request_id,
             state.tokens_processed,
             state.total_length - 1,
-            (
-                self.config.model_name
-                if self.config.model_name
-                else ""
-            ),
+            (self.config.model_name if self.config.model_name else ""),
         )
 
         # Memory monitoring — use max(active, phys_footprint) so MLX cache
@@ -5986,9 +5988,7 @@ class Scheduler:
                 # Speed priority runs full chunks through this caution band
                 # by design — the per-chunk notice is DEBUG there, not a
                 # warning about an unexpected state.
-                _log = (
-                    logger.debug if self._prefill_speed_priority else logger.warning
-                )
+                _log = logger.debug if self._prefill_speed_priority else logger.warning
                 _log(
                     f"Chunked prefill above max_bytes at "
                     f"{state.tokens_processed} tokens: "
@@ -6202,7 +6202,7 @@ class Scheduler:
                 still_prefilling.append(request)
                 still_prefilling.extend(pending_prefills[index + 1 :])
                 logger.info(
-                    "Paused chunked prefill request %s for LRU eviction " "(reason=%s)",
+                    "Paused chunked prefill request %s for LRU eviction (reason=%s)",
                     rid,
                     e.request.reason,
                 )
@@ -6359,8 +6359,7 @@ class Scheduler:
 
         pending_tokens = tuple(token for token, _ in pending)
         reported_match = tuple(
-            int(token)
-            for token in (getattr(response, "match_sequence", None) or ())
+            int(token) for token in (getattr(response, "match_sequence", None) or ())
         )
         matched_sequence = (
             reported_match
@@ -6392,7 +6391,7 @@ class Scheduler:
                 suppressed_stream_text
             ):
                 terminal_output.output_text = terminal_output.output_text[
-                    :-len(suppressed_stream_text)
+                    : -len(suppressed_stream_text)
                 ]
             else:
                 matched_prefix_tokens = matched_sequence[:-1]
@@ -6405,7 +6404,7 @@ class Scheduler:
                     and request.request_id not in self._output_parser_sessions
                 ):
                     terminal_output.output_text = self.tokenizer.decode(
-                        output_token_ids[:-len(matched_prefix_tokens)]
+                        output_token_ids[: -len(matched_prefix_tokens)]
                     )
             request.output_text = terminal_output.output_text
 
@@ -7127,6 +7126,7 @@ class Scheduler:
         pre-extracted marker alongside raw decode-path snapshots (those
         are already decoupled copies from ``extract_cache``).
         """
+
         def _copy_containers(value: Any) -> Any:
             # ArraysCache.state returns its live slot LIST (not a copy);
             # the model rebinds slots in place, so container structure
@@ -7904,9 +7904,9 @@ class Scheduler:
                 expected_cache = make_prompt_cache(self.model)
             except Exception:
                 expected_cache = None
-            if isinstance(expected_cache, (list, tuple)) and len(
-                expected_cache
-            ) == len(cache):
+            if isinstance(expected_cache, (list, tuple)) and len(expected_cache) == len(
+                cache
+            ):
                 arrays_names = {"ArraysCache", "SizedArraysCache"}
                 for layer_cache, expected_layer in zip(cache, expected_cache):
                     if (
@@ -8821,7 +8821,9 @@ class Scheduler:
                             draft_cache_list,
                             model_name=name,
                         )
-                        draft_layer_cache_types = draft_model_cache_config.get_type_names()
+                        draft_layer_cache_types = (
+                            draft_model_cache_config.get_type_names()
+                        )
                     except Exception as e:
                         logger.debug(
                             "Could not infer SpecPrefill draft cache layout: %s", e
@@ -8958,9 +8960,7 @@ class Scheduler:
                 "logits processors without vlm_mtp support (%s); falling "
                 "back to BatchGenerator",
                 request.request_id,
-                ", ".join(
-                    type(proc).__name__ for proc in unsupported_processors
-                ),
+                ", ".join(type(proc).__name__ for proc in unsupported_processors),
             )
             return None
 
@@ -9627,8 +9627,7 @@ class Scheduler:
             logger.warning(f"Idle reclaim failed: {e}")
             return
         logger.info(
-            "Idle reclaim: trimmed Metal transients between turns "
-            "(%.1fGB -> %.1fGB)",
+            "Idle reclaim: trimmed Metal transients between turns (%.1fGB -> %.1fGB)",
             before / 1024**3,
             after / 1024**3,
         )
@@ -9805,9 +9804,7 @@ class Scheduler:
         Active requests are intentionally not included: their memory is live
         and must remain charged to a concurrent admission.
         """
-        return bool(
-            self._pending_async_removes or self._deferred_clear_at is not None
-        )
+        return bool(self._pending_async_removes or self._deferred_clear_at is not None)
 
     def refresh_route_preflight_usage(self) -> int:
         """Publish a fresh MLX memory sample for route-level retry.
@@ -10265,8 +10262,7 @@ class Scheduler:
             return
 
         logger.warning(
-            "Preflight safety-cap rejected (%d tokens, cached=%d, "
-            "request_id=%s): %s",
+            "Preflight safety-cap rejected (%d tokens, cached=%d, request_id=%s): %s",
             num_prompt_tokens,
             cached_tokens,
             request_id,
@@ -10799,7 +10795,9 @@ class Scheduler:
                         check_abort=_check_specprefill_abort,
                         report_system_progress=_report_system_progress,
                         report_sparse_progress=_report_sparse_progress,
-                        sync_and_clear_cache=lambda: _sync_and_clear_cache(self._stream),
+                        sync_and_clear_cache=lambda: _sync_and_clear_cache(
+                            self._stream
+                        ),
                         log=logger,
                         extract_cache_states=self._extract_cache_states,
                         # Preserve an ordinary cache hit that already extends
@@ -11047,6 +11045,9 @@ class Scheduler:
                     self.request_id_to_uid.pop(request.request_id, None)
                     self._release_paged_cache_for_request(request.request_id)
                     get_prefill_tracker().remove(request.request_id)
+                    self._reset_partial_external_prefill_for_eviction(
+                        request, e.request
+                    )
                     self._pause_for_prefill_eviction(request, e.request)
                     break
                 except PrefillMemoryExceededError as e:
@@ -11677,11 +11678,7 @@ class Scheduler:
                                         )
                                     )
                                     if intermediate_snapshots is not None:
-                                        for (
-                                            snapshot_cache
-                                        ) in (
-                                            intermediate_snapshots.iter_in_memory_extracted()
-                                        ):
+                                        for snapshot_cache in intermediate_snapshots.iter_in_memory_extracted():
                                             pre_eval_arrays.extend(
                                                 self._collect_arrays_from_extracted_cache(
                                                     snapshot_cache
@@ -12305,6 +12302,38 @@ class Scheduler:
         )
         return True
 
+    def _reset_partial_external_prefill_for_eviction(
+        self,
+        request: "Request",
+        eviction: PrefillEvictionRequest,
+    ) -> None:
+        """Drop a restored prefix mutated before an external-prefill pause."""
+        if eviction.processed_tokens <= 0 or request.prompt_cache is None:
+            return
+
+        saved = getattr(request, "_prefill_saved_rope_deltas", None)
+        if saved is not None:
+            lm = getattr(self.model, "_language_model", None)
+            if lm is not None and hasattr(lm, "_rope_deltas"):
+                lm._rope_deltas = saved
+            request._prefill_saved_rope_deltas = None
+
+        request.prompt_cache = None
+        request.cached_tokens = 0
+        request.remaining_tokens = request.prompt_token_ids
+        request.block_table = None
+        request.shared_prefix_blocks = 0
+        request._extracted_cache = None
+        request._model_cache_config = None
+        self._prefix_cache_prepared.discard(request.request_id)
+        _sync_and_clear_cache(self._stream)
+        logger.info(
+            "Discarded partially advanced prefix for %s before prefill retry "
+            "(processed_tokens=%d)",
+            request.request_id,
+            eviction.processed_tokens,
+        )
+
     def _pause_for_prefill_eviction(
         self,
         request: "Request",
@@ -12312,11 +12341,9 @@ class Scheduler:
     ) -> None:
         """Hold a request until EngineCore can evict idle models asynchronously.
 
-        The request's prefix-cache state (prompt_cache, block_table,
-        cached_tokens, remaining_tokens) is deliberately left untouched so
-        a reconstructed prefix survives the pause and the retry prefills
-        only the uncached suffix instead of recomputing the prompt cold
-        (#2180).
+        An unmodified reconstructed prefix survives a pause before the first
+        forward. The external-prefill catch resets any prefix already extended
+        by completed chunks so retry cannot replay the same suffix twice.
         """
         self._pending_prefill_eviction_request = eviction
         request.status = RequestStatus.WAITING
@@ -12529,8 +12556,7 @@ class Scheduler:
                             finished=True,
                             finish_reason="error",
                             error=(
-                                f"Cache corruption not recoverable "
-                                f"after retries: {e}"
+                                f"Cache corruption not recoverable after retries: {e}"
                             ),
                         )
                     )
@@ -12573,7 +12599,7 @@ class Scheduler:
             import traceback
 
             logger.error(
-                f"Error in batch generation step: {e}\n" f"{traceback.format_exc()}"
+                f"Error in batch generation step: {e}\n{traceback.format_exc()}"
             )
             raise
 
@@ -13004,10 +13030,7 @@ class Scheduler:
             arrays_cache_layers = 0
             if not cache_factory_available:
                 actual_kv_cache_layers = num_layers
-            elif (
-                cache_list_for_tq is not None
-                and collect_kv_layer_specs is not None
-            ):
+            elif cache_list_for_tq is not None and collect_kv_layer_specs is not None:
                 try:
                     full_layers, rotating_layer_specs, arrays_cache_layers = (
                         collect_kv_layer_specs(cache_list_for_tq)
@@ -13317,12 +13340,15 @@ class Scheduler:
             # happy path here is ``has_model_info() is True``; this
             # else branch only fires for skeletal test fixtures.
             if self.memory_monitor is not None and self.memory_monitor.has_model_info():
-                # ``estimate_block_memory(1)`` returns full-attention
-                # KVCache-layer K+V bytes for one token at the dtype the
-                # monitor was configured with. Non-sliceable recurrent and
-                # rotating states are not duplicated in each SSD block.
-                expected_kv_bytes_per_token = self.memory_monitor.estimate_block_memory(
-                    1
+                # SSD boundary blocks also retain rotating windows and fixed
+                # recurrent snapshots. Convert that whole-block estimate back
+                # to the manager's effective per-token constructor input.
+                block_tokens = max(1, int(self.config.paged_cache_block_size))
+                block_payload = self.memory_monitor.estimate_paged_writer_block_memory(
+                    block_tokens
+                )
+                expected_kv_bytes_per_token = max(
+                    1, math.ceil(block_payload / block_tokens)
                 )
             else:
                 expected_kv_bytes_per_token = 200_000  # PagedSSDCacheManager default
