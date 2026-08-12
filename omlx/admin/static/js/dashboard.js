@@ -5893,8 +5893,7 @@
                         continue;
                     }
                     if (k === 'turboquant_mid_prefill') {
-                        out.turboquant_mid_prefill = !!ms.turboquant_kv_enabled
-                            && !!ms.turboquant_mid_prefill;
+                        out.turboquant_mid_prefill = !!ms.turboquant_mid_prefill;
                         continue;
                     }
                     if (k === 'guided_grammar_enabled') {
@@ -6803,8 +6802,7 @@
                                 forced_ct_kwargs: forcedCtKwargs.length > 0
                                     ? forcedCtKwargs : null,
                                 turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
-                                turboquant_mid_prefill: this.modelSettings.turboquant_kv_enabled
-                                    && !!this.modelSettings.turboquant_mid_prefill,
+                                turboquant_mid_prefill: !!this.modelSettings.turboquant_mid_prefill,
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
