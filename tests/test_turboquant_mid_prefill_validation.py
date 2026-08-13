@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import mlx.core as mx
 import pytest
@@ -846,19 +848,23 @@ def test_organic_pressure_uses_production_custom_tier_controls() -> None:
     assert scheduler._memory_limits_propagated is True
 
 
-def test_organic_first_attempt_requires_real_eviction_pause() -> None:
-    """The organic helper returns only the scheduler's typed pause request."""
-    from omlx.scheduler import PrefillEvictionRequest, _PrefillEvictionNeeded
-
-    context = SimpleNamespace(mid_triggered=False)
-    eviction = PrefillEvictionRequest(
+def test_organic_sole_model_requires_one_attempt_without_eviction_pause() -> None:
+    """The organic helper proves conversion without an external-victim restart."""
+    context = SimpleNamespace(
+        mid_triggered=True,
+        conversion_attempted=True,
+        trigger_tokens=2,
+        conversion_seconds=0.5,
+        converted_layers=1,
+        conversion_slices=1,
+        skipped_dense_layers=0,
+        conversion_completed_at=0.0,
+        post_trigger_tokens=1,
+    )
+    request = SimpleNamespace(
         request_id="organic",
-        model_id="model",
-        current_bytes=20,
-        target_cap_bytes=30,
-        predicted_transient_bytes=11,
-        requested_tokens=2048,
-        reason="turboquant_mid_prefill",
+        prefill_eviction_retries=0,
+        turboquant_mid_prefill_attempted=True,
     )
 
     class FakeMx:
@@ -880,46 +886,70 @@ def test_organic_first_attempt_requires_real_eviction_pause() -> None:
         def reset_peak_memory(self) -> None:
             return None
 
+        def get_peak_memory(self) -> int:
+            return 20
+
+        def stream(self, stream: Any) -> contextlib.AbstractContextManager[None]:
+            del stream
+            return contextlib.nullcontext()
+
     class FakeScheduler:
+        _stream = SimpleNamespace()
+        model = SimpleNamespace()
+
         def _new_prefill_context(
             self,
-            request: Any,
+            inner_request: Any,
             prompt_cache: list[Any],
             *,
             loop_label: str,
         ) -> Any:
-            del request, prompt_cache, loop_label
+            del inner_request, prompt_cache, loop_label
             return context
 
         def _do_external_prefill(
             self,
-            request: Any,
+            inner_request: Any,
             tokens: list[int],
             existing_cache: list[Any] | None,
         ) -> tuple[list[Any], list[int]]:
             self._new_prefill_context(
-                request,
+                inner_request,
                 [SimpleNamespace(state=None)],
                 loop_label="external",
             )
             del tokens, existing_cache
-            raise _PrefillEvictionNeeded(eviction)
+            return [SimpleNamespace(state=None)], [3]
 
     mx = FakeMx()
-    pause = validation._capture_initial_prefill_pause(
-        mx,
-        FakeScheduler(),
-        SimpleNamespace(request_id="organic"),
-        [1, 2],
-    )
+    with (
+        patch.object(
+            validation,
+            "_model_chunk",
+            return_value=SimpleNamespace(),
+        ),
+        patch.object(
+            validation,
+            "_teacher_forced_replay",
+            return_value={"mean_nll": 0.0},
+        ),
+    ):
+        metrics = validation._capture_no_victim_organic_prefill(
+            mx,
+            FakeScheduler(),
+            request,
+            [1, 2, 3],
+            [4],
+        )
 
-    assert pause.context is context
-    assert pause.eviction_request is eviction
-    assert pause.baseline == {
-        "mlx_active_baseline_bytes": 10,
-        "mlx_cache_baseline_bytes": 5,
-    }
-    assert pause.external_seconds >= 0
+    assert metrics["actual_mid_prefill_trigger"] is True
+    assert metrics["mid_prefill_conversion_attempt_count"] == 1
+    assert metrics["prefill_attempt_count"] == 1
+    assert metrics["eviction_pause_count"] == 0
+    assert metrics["prefill_eviction_retries"] == 0
+    assert metrics["external_prefill_attempt_seconds"] == [
+        metrics["external_prefill_seconds"]
+    ]
     assert mx.clear_count == 2
 
 
