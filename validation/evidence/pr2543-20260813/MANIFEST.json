@@ -1,0 +1,66 @@
+{
+  "artifacts": [
+    {
+      "evidence_provenance": {
+        "execution_route": "direct controlled loop",
+        "raw_source_sha256": "a596f1313eb363ac1251127e422ee6bf7c83c81022bdb5ddc42fdb08906529c8",
+        "runtime_commit": "dc7715729c8d65fe9bd668b4eedb7d58e03fedb7",
+        "runtime_commit_short": "dc771572",
+        "validator_commit": "ae6c326173f05888573c848437bc8bc3e4fb444f",
+        "validator_commit_short": "ae6c3261"
+      },
+      "sanitized_filename": "matrix-32k-row104-q5-45g.sanitized.json",
+      "sanitized_sha256": "d9b3ef6f447911cfd297ba690f8a16976120542719eaf894c792a9e2e9677dda",
+      "source_filename": "matrix-32k-row104-q5-45g.json",
+      "source_sha256": "a596f1313eb363ac1251127e422ee6bf7c83c81022bdb5ddc42fdb08906529c8"
+    },
+    {
+      "evidence_provenance": {
+        "execution_route": "direct controlled loop",
+        "raw_source_sha256": "bb2adf1fe8a0fc33b0b5dd5ebd49c04a542a05e4e2b2e90cb59db40cce079ef2",
+        "runtime_commit": "839efe11e2a66cf03eaf4c61385d0b3e95e47a2f",
+        "runtime_commit_short": "839efe11",
+        "validator_commit": "4689f46880fd22e5f1b76d5bf94c803811f382cd",
+        "validator_commit_short": "4689f468"
+      },
+      "sanitized_filename": "matrix-64k-row311-q5-45g.sanitized.json",
+      "sanitized_sha256": "1bb7e745b78f4bf767e6012fbafe69f85d16066ff1197b969f92652c24b08088",
+      "source_filename": "matrix-64k-row311-q5-45g.json",
+      "source_sha256": "bb2adf1fe8a0fc33b0b5dd5ebd49c04a542a05e4e2b2e90cb59db40cce079ef2"
+    },
+    {
+      "evidence_provenance": {
+        "execution_route": "production EnginePool/scheduler route",
+        "raw_source_sha256": "c2a4ac5e00edb13eb206be3bedf7834811d855e4a3f5b0da9623671105d1d640",
+        "runtime_commit": "839efe11e2a66cf03eaf4c61385d0b3e95e47a2f",
+        "runtime_commit_short": "839efe11",
+        "validator_commit": "4689f46880fd22e5f1b76d5bf94c803811f382cd",
+        "validator_commit_short": "4689f468"
+      },
+      "sanitized_filename": "organic-131071-q8-q5-45g.sanitized.json",
+      "sanitized_sha256": "ef6f5be01f452c0116adac57f77206da5ea4691f276a70d078a76528824853b1",
+      "source_filename": "organic-131071-q8-q5-45g.json",
+      "source_sha256": "c2a4ac5e00edb13eb206be3bedf7834811d855e4a3f5b0da9623671105d1d640"
+    }
+  ],
+  "fixed_envelope": "The final Q5 campaign used a fixed, disclosed 45 GiB child ceiling and 3 GiB host floor matching this machine’s configured Metal envelope. Limits were not changed during a command, mandatory telemetry remained fail-closed, and the product’s own memory guard remained active.",
+  "sanitization_policy": {
+    "preserved": [
+      "metrics and configured limits",
+      "model and dataset identifiers",
+      "source tensor hashes, relative tensor names, and sizes",
+      "answer, response, prompt, replay, and token hashes and counts",
+      "proof and provenance fields",
+      "aggregate polling sample counts"
+    ],
+    "removed": [
+      "absolute local filesystem paths",
+      "dataset cache locations",
+      "local model filesystem locations",
+      "generated response bodies",
+      "detailed polling sample payloads"
+    ],
+    "replacement": "Generated response bodies are represented by their existing SHA-256 and token evidence plus per-result omission metadata. The source artifacts contain aggregate polling sample counts rather than detailed polling arrays; those counts are preserved with omission metadata."
+  },
+  "schema_version": 1
+}

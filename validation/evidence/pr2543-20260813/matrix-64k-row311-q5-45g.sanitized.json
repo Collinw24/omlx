@@ -1,0 +1,666 @@
+{
+  "config": {
+    "child_memory_limit_bytes": 48318382080,
+    "chunk_size": 2048,
+    "dataset": {
+      "filename": "2needle/2needle_0.parquet",
+      "matrix_row_indices": [
+        104,
+        109,
+        136,
+        301,
+        311,
+        328
+      ],
+      "organic_row_index": 35,
+      "repo_id": "openai/mrcr",
+      "revision": "f4c69fae7cf81f7ca26b9fee34b392a50f6b8a1d"
+    },
+    "greedy_token_limit": 1024,
+    "host_headroom_minimum_bytes": 3221225472,
+    "max_prompt_tokens": 65536,
+    "model": {
+      "repo_id": "Basher17/Qwen3.6-27B-heretic-v2-oQ5e-mtp",
+      "snapshot": "9a88654f6e3294f12344619d7078afc92fd41fe4"
+    },
+    "modes": [
+      {
+        "bits": null,
+        "conversion": "dense",
+        "name": "dense"
+      },
+      {
+        "bits": 8.0,
+        "conversion": "ordinary",
+        "name": "ordinary-q8"
+      },
+      {
+        "bits": 4.0,
+        "conversion": "ordinary",
+        "name": "ordinary-q4"
+      },
+      {
+        "bits": 8.0,
+        "conversion": "mid",
+        "name": "mid-q8"
+      },
+      {
+        "bits": 4.0,
+        "conversion": "mid",
+        "name": "mid-q4"
+      }
+    ],
+    "poll_interval_seconds": 0.25,
+    "rows": [
+      311
+    ],
+    "teacher_forced_replay_token_limit": 256,
+    "thinking_enabled": false,
+    "trust_remote_code": false
+  },
+  "error": null,
+  "evidence_provenance": {
+    "execution_route": "direct controlled loop",
+    "raw_source_sha256": "bb2adf1fe8a0fc33b0b5dd5ebd49c04a542a05e4e2b2e90cb59db40cce079ef2",
+    "runtime_commit": "839efe11e2a66cf03eaf4c61385d0b3e95e47a2f",
+    "runtime_commit_short": "839efe11",
+    "validator_commit": "4689f46880fd22e5f1b76d5bf94c803811f382cd",
+    "validator_commit_short": "4689f468"
+  },
+  "kind": "matrix",
+  "provenance": {
+    "config_sha256": "431cd220e6e31a62cf782fe46ae9a66937ed5e00e3bd951e0f905c27f0a6b262",
+    "git": {
+      "head": "4689f46880fd22e5f1b76d5bf94c803811f382cd",
+      "tracked_worktree_clean": true
+    },
+    "hardware": {
+      "chip": "Apple M3 Max",
+      "machine": "arm64",
+      "macos_version": "27.0",
+      "physical_memory_bytes": 51539607552,
+      "platform": "macOS-27.0-arm64-arm-64bit",
+      "processor": "arm"
+    },
+    "packages": {
+      "huggingface-hub": "1.27.0",
+      "mlx": "0.32.0",
+      "mlx-lm": "0.31.3",
+      "mlx-vlm": "0.6.3",
+      "omlx": "0.5.8.dev3",
+      "pyarrow": "25.0.1",
+      "transformers": "5.12.1"
+    }
+  },
+  "results": [
+    {
+      "kind": "matrix",
+      "metadata": {
+        "chunk_size": 2048,
+        "dataset": {
+          "filename": "2needle/2needle_0.parquet",
+          "repo_id": "openai/mrcr",
+          "revision": "f4c69fae7cf81f7ca26b9fee34b392a50f6b8a1d",
+          "row_index": 311
+        },
+        "greedy_token_limit": 1024,
+        "max_prompt_tokens": 65536,
+        "performance_cell": "primary_64k",
+        "quality_cell": true,
+        "teacher_forced_replay_token_limit": 256,
+        "thinking_enabled": false
+      },
+      "metrics": {
+        "answer_sha256": "4fa2389c23590156ad0323ae69c0eff953fa5241d111dd687b8df4c4fb5c52fa",
+        "answer_token_count": 525,
+        "answer_token_ids_sha256": "deb11166d719334db106d0cd1da550d29f87ab29e09b0caf4eafc6b33566b29d",
+        "dataset_prompt_sha256": "6cf54488d4827fcc2b8726c650d0e238136011e68c45a184b6e31842bebe4c3b",
+        "greedy_retrieval": {
+          "official_score": 0.999418942475305,
+          "required_prefix": "6l5tTGyk3n",
+          "response_omission": {
+            "content": "generated response body",
+            "omitted": true,
+            "response_sha256": "22961aff1ec7fda7916f800b613a0089e2f5cc4671ee1e5efc2f6f51b177fecb",
+            "token_count": 524,
+            "token_ids_sha256": "d259234a89a218537074c49e2ee45a396df6d3444a69c6ef309dfa278be5e015"
+          },
+          "response_sha256": "22961aff1ec7fda7916f800b613a0089e2f5cc4671ee1e5efc2f6f51b177fecb",
+          "token_count": 524,
+          "token_ids_sha256": "d259234a89a218537074c49e2ee45a396df6d3444a69c6ef309dfa278be5e015"
+        },
+        "memory": {
+          "mlx_active_baseline_bytes": 19009289224,
+          "mlx_active_final_bytes": 23346183178,
+          "mlx_cache_baseline_bytes": 0,
+          "mlx_cache_final_bytes": 8354615752,
+          "mlx_peak_bytes": 31973088326
+        },
+        "prefill": {
+          "conversion": null,
+          "conversion_seconds": 0.0,
+          "held_final_prompt_tokens": 1,
+          "midpoint_token_index": 31558,
+          "prefix_forward_seconds": 292.6382216670172,
+          "prompt_tokens": 63118,
+          "same_boundary_suffix_forward_seconds": 374.3039740420063,
+          "same_boundary_suffix_seconds": 377.2844254169977,
+          "same_boundary_suffix_tokens": 31560,
+          "same_boundary_suffix_tokens_per_second": 83.65041828884924,
+          "total_prefill_seconds": 670.9342814580014,
+          "total_prefill_tokens_per_second": 94.07478756762708
+        },
+        "prompt_token_count": 63118,
+        "prompt_token_ids_sha256": "5ac2efac85d640012602e2389b1ac6d113a91b4fe0d1c692c161630971e9837d",
+        "rendered_prompt_sha256": "1f63f95f1dae9f41aea5facdf848107686c40e3335fdbb8f8cd4eeb3d377ee17",
+        "teacher_forced": {
+          "decode_seconds": 28.23410171296564,
+          "decode_tokens_per_second": 9.067049577229508,
+          "first_token_nll": 0.0,
+          "latency_median_seconds": 0.1131679374993837,
+          "latency_p95_seconds": 0.13220620900392532,
+          "mean_nll": 4.559755325317383e-06,
+          "nll_sum": 0.00116729736328125,
+          "perplexity": 1.000004559765721,
+          "token_count": 256,
+          "token_ids_sha256": "4cfdbf5d75ea40e02d1c0d629407c45963ddbe8f39c59af87f979c15f781077b",
+          "tokens_2_to_n_count": 255,
+          "tokens_2_to_n_mean_nll": 4.57763671875e-06,
+          "tokens_2_to_n_perplexity": 1.0000045776471962
+        },
+        "teacher_forced_replay_truncated": true
+      },
+      "mode": "dense",
+      "schema_version": 1,
+      "status": "ok",
+      "supervision": {
+        "child_limit_bytes": 48318382080,
+        "host_headroom_metric": "host_statistics64.free+inactive",
+        "host_minimum_bytes": 3221225472,
+        "minimum_host_headroom_bytes": 6548717568,
+        "peak_child_phys_footprint_bytes": 36991466256,
+        "poll_interval_seconds": 0.25,
+        "polling_sample_payload_omission": {
+          "detail_payload_in_public_artifact": false,
+          "detail_payload_in_source_artifact": false,
+          "preserved_sample_count": 5151
+        },
+        "samples": 5151
+      }
+    },
+    {
+      "kind": "matrix",
+      "metadata": {
+        "chunk_size": 2048,
+        "dataset": {
+          "filename": "2needle/2needle_0.parquet",
+          "repo_id": "openai/mrcr",
+          "revision": "f4c69fae7cf81f7ca26b9fee34b392a50f6b8a1d",
+          "row_index": 311
+        },
+        "greedy_token_limit": 1024,
+        "max_prompt_tokens": 65536,
+        "performance_cell": "primary_64k",
+        "quality_cell": true,
+        "teacher_forced_replay_token_limit": 256,
+        "thinking_enabled": false
+      },
+      "metrics": {
+        "answer_sha256": "4fa2389c23590156ad0323ae69c0eff953fa5241d111dd687b8df4c4fb5c52fa",
+        "answer_token_count": 525,
+        "answer_token_ids_sha256": "deb11166d719334db106d0cd1da550d29f87ab29e09b0caf4eafc6b33566b29d",
+        "dataset_prompt_sha256": "6cf54488d4827fcc2b8726c650d0e238136011e68c45a184b6e31842bebe4c3b",
+        "greedy_retrieval": {
+          "official_score": 0.999418942475305,
+          "required_prefix": "6l5tTGyk3n",
+          "response_omission": {
+            "content": "generated response body",
+            "omitted": true,
+            "response_sha256": "22961aff1ec7fda7916f800b613a0089e2f5cc4671ee1e5efc2f6f51b177fecb",
+            "token_count": 524,
+            "token_ids_sha256": "d259234a89a218537074c49e2ee45a396df6d3444a69c6ef309dfa278be5e015"
+          },
+          "response_sha256": "22961aff1ec7fda7916f800b613a0089e2f5cc4671ee1e5efc2f6f51b177fecb",
+          "token_count": 524,
+          "token_ids_sha256": "d259234a89a218537074c49e2ee45a396df6d3444a69c6ef309dfa278be5e015"
+        },
+        "memory": {
+          "mlx_active_baseline_bytes": 19009290248,
+          "mlx_active_final_bytes": 21399831442,
+          "mlx_cache_baseline_bytes": 0,
+          "mlx_cache_final_bytes": 20941644658,
+          "mlx_peak_bytes": 31973616710
+        },
+        "prefill": {
+          "conversion": {
+            "path": "ordinary_from_cache"
+          },
+          "conversion_seconds": 2.5691241249951418,
+          "held_final_prompt_tokens": 1,
+          "midpoint_token_index": 31558,
+          "prefix_forward_seconds": 208.9067110830074,
+          "prompt_tokens": 63118,
+          "same_boundary_suffix_forward_seconds": 288.9601355409977,
+          "same_boundary_suffix_seconds": 290.172936707997,
+          "same_boundary_suffix_tokens": 31560,
+          "same_boundary_suffix_tokens_per_second": 108.76272735165183,
+          "total_prefill_seconds": 502.00820116700197,
+          "total_prefill_tokens_per_second": 125.73101366326618
+        },
+        "prompt_token_count": 63118,
+        "prompt_token_ids_sha256": "5ac2efac85d640012602e2389b1ac6d113a91b4fe0d1c692c161630971e9837d",
+        "rendered_prompt_sha256": "1f63f95f1dae9f41aea5facdf848107686c40e3335fdbb8f8cd4eeb3d377ee17",
+        "teacher_forced": {
+          "decode_seconds": 31.617249200040533,
+          "decode_tokens_per_second": 8.096846072227935,
+          "first_token_nll": 0.0,
+          "latency_median_seconds": 0.11883720849800739,
+          "latency_p95_seconds": 0.14234070800011978,
+          "mean_nll": 4.3138861656188965e-06,
+          "nll_sum": 0.0011043548583984375,
+          "perplexity": 1.0000043138954704,
+          "token_count": 256,
+          "token_ids_sha256": "4cfdbf5d75ea40e02d1c0d629407c45963ddbe8f39c59af87f979c15f781077b",
+          "tokens_2_to_n_count": 255,
+          "tokens_2_to_n_mean_nll": 4.330803366268382e-06,
+          "tokens_2_to_n_perplexity": 1.0000043308127442
+        },
+        "teacher_forced_replay_truncated": true
+      },
+      "mode": "ordinary-q8",
+      "schema_version": 1,
+      "status": "ok",
+      "supervision": {
+        "child_limit_bytes": 48318382080,
+        "host_headroom_metric": "host_statistics64.free+inactive",
+        "host_minimum_bytes": 3221225472,
+        "minimum_host_headroom_bytes": 3813376000,
+        "peak_child_phys_footprint_bytes": 43114805936,
+        "poll_interval_seconds": 0.25,
+        "polling_sample_payload_omission": {
+          "detail_payload_in_public_artifact": false,
+          "detail_payload_in_source_artifact": false,
+          "preserved_sample_count": 4326
+        },
+        "samples": 4326
+      }
+    },
+    {
+      "kind": "matrix",
+      "metadata": {
+        "chunk_size": 2048,
+        "dataset": {
+          "filename": "2needle/2needle_0.parquet",
+          "repo_id": "openai/mrcr",
+          "revision": "f4c69fae7cf81f7ca26b9fee34b392a50f6b8a1d",
+          "row_index": 311
+        },
+        "greedy_token_limit": 1024,
+        "max_prompt_tokens": 65536,
+        "performance_cell": "primary_64k",
+        "quality_cell": true,
+        "teacher_forced_replay_token_limit": 256,
+        "thinking_enabled": false
+      },
+      "metrics": {
+        "answer_sha256": "4fa2389c23590156ad0323ae69c0eff953fa5241d111dd687b8df4c4fb5c52fa",
+        "answer_token_count": 525,
+        "answer_token_ids_sha256": "deb11166d719334db106d0cd1da550d29f87ab29e09b0caf4eafc6b33566b29d",
+        "dataset_prompt_sha256": "6cf54488d4827fcc2b8726c650d0e238136011e68c45a184b6e31842bebe4c3b",
+        "greedy_retrieval": {
+          "official_score": 0.999418942475305,
+          "required_prefix": "6l5tTGyk3n",
+          "response_omission": {
+            "content": "generated response body",
+            "omitted": true,
+            "response_sha256": "22961aff1ec7fda7916f800b613a0089e2f5cc4671ee1e5efc2f6f51b177fecb",
+            "token_count": 524,
+            "token_ids_sha256": "d259234a89a218537074c49e2ee45a396df6d3444a69c6ef309dfa278be5e015"
+          },
+          "response_sha256": "22961aff1ec7fda7916f800b613a0089e2f5cc4671ee1e5efc2f6f51b177fecb",
+          "token_count": 524,
+          "token_ids_sha256": "d259234a89a218537074c49e2ee45a396df6d3444a69c6ef309dfa278be5e015"
+        },
+        "memory": {
+          "mlx_active_baseline_bytes": 19009290248,
+          "mlx_active_final_bytes": 20420693842,
+          "mlx_cache_baseline_bytes": 0,
+          "mlx_cache_final_bytes": 11677264194,
+          "mlx_peak_bytes": 31973615750
+        },
+        "prefill": {
+          "conversion": {
+            "path": "ordinary_from_cache"
+          },
+          "conversion_seconds": 0.8084295000007842,
+          "held_final_prompt_tokens": 1,
+          "midpoint_token_index": 31558,
+          "prefix_forward_seconds": 207.3453172510126,
+          "prompt_tokens": 63118,
+          "same_boundary_suffix_forward_seconds": 322.09071004200086,
+          "same_boundary_suffix_seconds": 323.19597129199974,
+          "same_boundary_suffix_tokens": 31560,
+          "same_boundary_suffix_tokens_per_second": 97.64973206143806,
+          "total_prefill_seconds": 531.6865272919968,
+          "total_prefill_tokens_per_second": 118.71280681395984
+        },
+        "prompt_token_count": 63118,
+        "prompt_token_ids_sha256": "5ac2efac85d640012602e2389b1ac6d113a91b4fe0d1c692c161630971e9837d",
+        "rendered_prompt_sha256": "1f63f95f1dae9f41aea5facdf848107686c40e3335fdbb8f8cd4eeb3d377ee17",
+        "teacher_forced": {
+          "decode_seconds": 30.279219823976746,
+          "decode_tokens_per_second": 8.454643200459385,
+          "first_token_nll": 0.0,
+          "latency_median_seconds": 0.11764541599768563,
+          "latency_p95_seconds": 0.1308299160009483,
+          "mean_nll": 5.461275577545166e-06,
+          "nll_sum": 0.0013980865478515625,
+          "perplexity": 1.0000054612904903,
+          "token_count": 256,
+          "token_ids_sha256": "4cfdbf5d75ea40e02d1c0d629407c45963ddbe8f39c59af87f979c15f781077b",
+          "tokens_2_to_n_count": 255,
+          "tokens_2_to_n_mean_nll": 5.482692344515931e-06,
+          "tokens_2_to_n_perplexity": 1.0000054827073745
+        },
+        "teacher_forced_replay_truncated": true
+      },
+      "mode": "ordinary-q4",
+      "schema_version": 1,
+      "status": "ok",
+      "supervision": {
+        "child_limit_bytes": 48318382080,
+        "host_headroom_metric": "host_statistics64.free+inactive",
+        "host_minimum_bytes": 3221225472,
+        "minimum_host_headroom_bytes": 6946111488,
+        "peak_child_phys_footprint_bytes": 37033032464,
+        "poll_interval_seconds": 0.25,
+        "polling_sample_payload_omission": {
+          "detail_payload_in_public_artifact": false,
+          "detail_payload_in_source_artifact": false,
+          "preserved_sample_count": 4709
+        },
+        "samples": 4709
+      }
+    },
+    {
+      "kind": "matrix",
+      "metadata": {
+        "chunk_size": 2048,
+        "dataset": {
+          "filename": "2needle/2needle_0.parquet",
+          "repo_id": "openai/mrcr",
+          "revision": "f4c69fae7cf81f7ca26b9fee34b392a50f6b8a1d",
+          "row_index": 311
+        },
+        "greedy_token_limit": 1024,
+        "max_prompt_tokens": 65536,
+        "performance_cell": "primary_64k",
+        "quality_cell": true,
+        "teacher_forced_replay_token_limit": 256,
+        "thinking_enabled": false
+      },
+      "metrics": {
+        "answer_sha256": "4fa2389c23590156ad0323ae69c0eff953fa5241d111dd687b8df4c4fb5c52fa",
+        "answer_token_count": 525,
+        "answer_token_ids_sha256": "deb11166d719334db106d0cd1da550d29f87ab29e09b0caf4eafc6b33566b29d",
+        "dataset_prompt_sha256": "6cf54488d4827fcc2b8726c650d0e238136011e68c45a184b6e31842bebe4c3b",
+        "greedy_retrieval": {
+          "official_score": 0.999418942475305,
+          "required_prefix": "6l5tTGyk3n",
+          "response_omission": {
+            "content": "generated response body",
+            "omitted": true,
+            "response_sha256": "22961aff1ec7fda7916f800b613a0089e2f5cc4671ee1e5efc2f6f51b177fecb",
+            "token_count": 524,
+            "token_ids_sha256": "d259234a89a218537074c49e2ee45a396df6d3444a69c6ef309dfa278be5e015"
+          },
+          "response_sha256": "22961aff1ec7fda7916f800b613a0089e2f5cc4671ee1e5efc2f6f51b177fecb",
+          "token_count": 524,
+          "token_ids_sha256": "d259234a89a218537074c49e2ee45a396df6d3444a69c6ef309dfa278be5e015"
+        },
+        "memory": {
+          "mlx_active_baseline_bytes": 19009290248,
+          "mlx_active_final_bytes": 21399831442,
+          "mlx_cache_baseline_bytes": 0,
+          "mlx_cache_final_bytes": 13299276658,
+          "mlx_peak_bytes": 26786384950
+        },
+        "prefill": {
+          "conversion": {
+            "already_quantized_layers": 0,
+            "converted_bytes": 977035680,
+            "converted_layers": 15,
+            "path": "sliced",
+            "skipped_dense_layers": 1,
+            "slices": 60,
+            "source_bytes": 1938923520
+          },
+          "conversion_seconds": 2.5275784169934923,
+          "held_final_prompt_tokens": 1,
+          "midpoint_token_index": 31558,
+          "prefix_forward_seconds": 222.89107450198208,
+          "prompt_tokens": 63118,
+          "same_boundary_suffix_forward_seconds": 406.5694327889796,
+          "same_boundary_suffix_seconds": 407.28261945801205,
+          "same_boundary_suffix_tokens": 31560,
+          "same_boundary_suffix_tokens_per_second": 77.48918930544644,
+          "total_prefill_seconds": 633.0687529999996,
+          "total_prefill_tokens_per_second": 99.70165120438355
+        },
+        "prompt_token_count": 63118,
+        "prompt_token_ids_sha256": "5ac2efac85d640012602e2389b1ac6d113a91b4fe0d1c692c161630971e9837d",
+        "rendered_prompt_sha256": "1f63f95f1dae9f41aea5facdf848107686c40e3335fdbb8f8cd4eeb3d377ee17",
+        "teacher_forced": {
+          "decode_seconds": 29.829481922017294,
+          "decode_tokens_per_second": 8.582113516730073,
+          "first_token_nll": 0.0,
+          "latency_median_seconds": 0.11534881249826867,
+          "latency_p95_seconds": 0.1294424999941839,
+          "mean_nll": 4.410743713378906e-06,
+          "nll_sum": 0.001129150390625,
+          "perplexity": 1.0000044107534407,
+          "token_count": 256,
+          "token_ids_sha256": "4cfdbf5d75ea40e02d1c0d629407c45963ddbe8f39c59af87f979c15f781077b",
+          "tokens_2_to_n_count": 255,
+          "tokens_2_to_n_mean_nll": 4.42804074754902e-06,
+          "tokens_2_to_n_perplexity": 1.0000044280505513
+        },
+        "teacher_forced_replay_truncated": true
+      },
+      "mode": "mid-q8",
+      "schema_version": 1,
+      "status": "ok",
+      "supervision": {
+        "child_limit_bytes": 48318382080,
+        "host_headroom_metric": "host_statistics64.free+inactive",
+        "host_minimum_bytes": 3221225472,
+        "minimum_host_headroom_bytes": 4067737600,
+        "peak_child_phys_footprint_bytes": 35469966072,
+        "poll_interval_seconds": 0.25,
+        "polling_sample_payload_omission": {
+          "detail_payload_in_public_artifact": false,
+          "detail_payload_in_source_artifact": false,
+          "preserved_sample_count": 5286
+        },
+        "samples": 5286
+      }
+    },
+    {
+      "kind": "matrix",
+      "metadata": {
+        "chunk_size": 2048,
+        "dataset": {
+          "filename": "2needle/2needle_0.parquet",
+          "repo_id": "openai/mrcr",
+          "revision": "f4c69fae7cf81f7ca26b9fee34b392a50f6b8a1d",
+          "row_index": 311
+        },
+        "greedy_token_limit": 1024,
+        "max_prompt_tokens": 65536,
+        "performance_cell": "primary_64k",
+        "quality_cell": true,
+        "teacher_forced_replay_token_limit": 256,
+        "thinking_enabled": false
+      },
+      "metrics": {
+        "answer_sha256": "4fa2389c23590156ad0323ae69c0eff953fa5241d111dd687b8df4c4fb5c52fa",
+        "answer_token_count": 525,
+        "answer_token_ids_sha256": "deb11166d719334db106d0cd1da550d29f87ab29e09b0caf4eafc6b33566b29d",
+        "dataset_prompt_sha256": "6cf54488d4827fcc2b8726c650d0e238136011e68c45a184b6e31842bebe4c3b",
+        "greedy_retrieval": {
+          "official_score": 0.999418942475305,
+          "required_prefix": "6l5tTGyk3n",
+          "response_omission": {
+            "content": "generated response body",
+            "omitted": true,
+            "response_sha256": "22961aff1ec7fda7916f800b613a0089e2f5cc4671ee1e5efc2f6f51b177fecb",
+            "token_count": 524,
+            "token_ids_sha256": "d259234a89a218537074c49e2ee45a396df6d3444a69c6ef309dfa278be5e015"
+          },
+          "response_sha256": "22961aff1ec7fda7916f800b613a0089e2f5cc4671ee1e5efc2f6f51b177fecb",
+          "token_count": 524,
+          "token_ids_sha256": "d259234a89a218537074c49e2ee45a396df6d3444a69c6ef309dfa278be5e015"
+        },
+        "memory": {
+          "mlx_active_baseline_bytes": 19009290248,
+          "mlx_active_final_bytes": 20420693842,
+          "mlx_cache_baseline_bytes": 0,
+          "mlx_cache_final_bytes": 4743797058,
+          "mlx_peak_bytes": 26786383990
+        },
+        "prefill": {
+          "conversion": {
+            "already_quantized_layers": 0,
+            "converted_bytes": 492304800,
+            "converted_layers": 15,
+            "path": "sliced",
+            "skipped_dense_layers": 1,
+            "slices": 60,
+            "source_bytes": 1938923520
+          },
+          "conversion_seconds": 0.5723669159924611,
+          "held_final_prompt_tokens": 1,
+          "midpoint_token_index": 31558,
+          "prefix_forward_seconds": 194.82205537300615,
+          "prompt_tokens": 63118,
+          "same_boundary_suffix_forward_seconds": 352.1976139159815,
+          "same_boundary_suffix_seconds": 352.4514494989853,
+          "same_boundary_suffix_tokens": 31560,
+          "same_boundary_suffix_tokens_per_second": 89.54424799461879,
+          "total_prefill_seconds": 548.2620265830046,
+          "total_prefill_tokens_per_second": 115.12378559824295
+        },
+        "prompt_token_count": 63118,
+        "prompt_token_ids_sha256": "5ac2efac85d640012602e2389b1ac6d113a91b4fe0d1c692c161630971e9837d",
+        "rendered_prompt_sha256": "1f63f95f1dae9f41aea5facdf848107686c40e3335fdbb8f8cd4eeb3d377ee17",
+        "teacher_forced": {
+          "decode_seconds": 22.877847048992408,
+          "decode_tokens_per_second": 11.18986412715242,
+          "first_token_nll": 0.0,
+          "latency_median_seconds": 0.08824918750178767,
+          "latency_p95_seconds": 0.09960041599697433,
+          "mean_nll": 5.200505256652832e-06,
+          "nll_sum": 0.001331329345703125,
+          "perplexity": 1.0000052005187794,
+          "token_count": 256,
+          "token_ids_sha256": "4cfdbf5d75ea40e02d1c0d629407c45963ddbe8f39c59af87f979c15f781077b",
+          "tokens_2_to_n_count": 255,
+          "tokens_2_to_n_mean_nll": 5.220899394914216e-06,
+          "tokens_2_to_n_perplexity": 1.000005220913024
+        },
+        "teacher_forced_replay_truncated": true
+      },
+      "mode": "mid-q4",
+      "schema_version": 1,
+      "status": "ok",
+      "supervision": {
+        "child_limit_bytes": 48318382080,
+        "host_headroom_metric": "host_statistics64.free+inactive",
+        "host_minimum_bytes": 3221225472,
+        "minimum_host_headroom_bytes": 9776168960,
+        "peak_child_phys_footprint_bytes": 29798267688,
+        "poll_interval_seconds": 0.25,
+        "polling_sample_payload_omission": {
+          "detail_payload_in_public_artifact": false,
+          "detail_payload_in_source_artifact": false,
+          "preserved_sample_count": 4552
+        },
+        "samples": 4552
+      }
+    }
+  ],
+  "sanitization": {
+    "fixed_envelope": "The final Q5 campaign used a fixed, disclosed 45 GiB child ceiling and 3 GiB host floor matching this machine’s configured Metal envelope. Limits were not changed during a command, mandatory telemetry remained fail-closed, and the product’s own memory guard remained active.",
+    "generated_response_bodies": {
+      "included": false,
+      "replacement": "existing response and token hashes/counts plus per-result omission metadata"
+    },
+    "local_filesystem_paths": {
+      "included": false,
+      "replacement": "public model and dataset identifiers"
+    },
+    "polling_sample_payloads": {
+      "included": false,
+      "replacement": "aggregate sample counts plus per-result omission metadata"
+    }
+  },
+  "schema_version": 1,
+  "source_tensors": {
+    "after": [
+      {
+        "path": "model-00001-of-00005.safetensors",
+        "sha256": "7cd738dc6c3ef480d5e7a062ed81136ffe74102d309ece71a14ace37721f4528",
+        "size_bytes": 5047702365
+      },
+      {
+        "path": "model-00002-of-00005.safetensors",
+        "sha256": "acb5e76adb0713f1da002ec05b88cc509097411cbd0f1bda1037b84eb4296217",
+        "size_bytes": 5030984870
+      },
+      {
+        "path": "model-00003-of-00005.safetensors",
+        "sha256": "f39baa70564267a59ead58bfa56a27dbb588a5826874ac57c4103b1a4ee3e511",
+        "size_bytes": 5005108113
+      },
+      {
+        "path": "model-00004-of-00005.safetensors",
+        "sha256": "14db05492f288ea054bcb43b4ae9b7f345396e195ee8c51411ceb2276666c1c0",
+        "size_bytes": 5012433624
+      },
+      {
+        "path": "model-00005-of-00005.safetensors",
+        "sha256": "afbbee7b01452e9cd32922b385b3ca220ad1de8bfcb41a88d622eab3eedd131e",
+        "size_bytes": 194686844
+      }
+    ],
+    "before": [
+      {
+        "path": "model-00001-of-00005.safetensors",
+        "sha256": "7cd738dc6c3ef480d5e7a062ed81136ffe74102d309ece71a14ace37721f4528",
+        "size_bytes": 5047702365
+      },
+      {
+        "path": "model-00002-of-00005.safetensors",
+        "sha256": "acb5e76adb0713f1da002ec05b88cc509097411cbd0f1bda1037b84eb4296217",
+        "size_bytes": 5030984870
+      },
+      {
+        "path": "model-00003-of-00005.safetensors",
+        "sha256": "f39baa70564267a59ead58bfa56a27dbb588a5826874ac57c4103b1a4ee3e511",
+        "size_bytes": 5005108113
+      },
+      {
+        "path": "model-00004-of-00005.safetensors",
+        "sha256": "14db05492f288ea054bcb43b4ae9b7f345396e195ee8c51411ceb2276666c1c0",
+        "size_bytes": 5012433624
+      },
+      {
+        "path": "model-00005-of-00005.safetensors",
+        "sha256": "afbbee7b01452e9cd32922b385b3ca220ad1de8bfcb41a88d622eab3eedd131e",
+        "size_bytes": 194686844
+      }
+    ],
+    "unchanged": true
+  },
+  "status": "ok"
+}

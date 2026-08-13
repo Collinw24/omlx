@@ -1,0 +1,251 @@
+{
+  "config": {
+    "child_memory_limit_bytes": 48318382080,
+    "chunk_size": 2048,
+    "dataset": {
+      "filename": "2needle/2needle_0.parquet",
+      "matrix_row_indices": [
+        104,
+        109,
+        136,
+        301,
+        311,
+        328
+      ],
+      "organic_row_index": 35,
+      "repo_id": "openai/mrcr",
+      "revision": "f4c69fae7cf81f7ca26b9fee34b392a50f6b8a1d",
+      "row_index": 35
+    },
+    "exclusive_ownership": true,
+    "forced_trigger": false,
+    "host_headroom_minimum_bytes": 3221225472,
+    "mode": "organic-mid-q8",
+    "model": {
+      "repo_id": "Basher17/Qwen3.6-27B-heretic-v2-oQ5e-mtp",
+      "snapshot": "9a88654f6e3294f12344619d7078afc92fd41fe4"
+    },
+    "no_cache": true,
+    "poll_interval_seconds": 0.25,
+    "prefill_abort_margin": 0.95,
+    "prefill_min_chunk_tokens": 32,
+    "prompt_tokens": 131071,
+    "scheduler": {
+      "chunked_prefill": false,
+      "completion_batch_size": 1,
+      "max_num_batched_tokens": 8192,
+      "max_num_seqs": 1,
+      "prefill_abort_margin": 0.95,
+      "prefill_min_chunk_tokens": 32,
+      "prefill_speed_priority": false,
+      "prefill_step_size": 2048
+    },
+    "scheduler_hard_limit_bytes": 48318382080,
+    "scheduler_soft_limit_bytes": 42949672960,
+    "teacher_forced_replay_tokens": 256,
+    "thinking_enabled": false,
+    "trust_remote_code": false,
+    "turboquant_bits": 8.0,
+    "turboquant_skip_last": true
+  },
+  "error": null,
+  "evidence_provenance": {
+    "execution_route": "production EnginePool/scheduler route",
+    "raw_source_sha256": "c2a4ac5e00edb13eb206be3bedf7834811d855e4a3f5b0da9623671105d1d640",
+    "runtime_commit": "839efe11e2a66cf03eaf4c61385d0b3e95e47a2f",
+    "runtime_commit_short": "839efe11",
+    "validator_commit": "4689f46880fd22e5f1b76d5bf94c803811f382cd",
+    "validator_commit_short": "4689f468"
+  },
+  "kind": "organic",
+  "provenance": {
+    "config_sha256": "d8079ece5de14f8b4481a5f5423ab5d002f5a04482535f040bd6ef654f28066a",
+    "git": {
+      "head": "4689f46880fd22e5f1b76d5bf94c803811f382cd",
+      "tracked_worktree_clean": true
+    },
+    "hardware": {
+      "chip": "Apple M3 Max",
+      "machine": "arm64",
+      "macos_version": "27.0",
+      "physical_memory_bytes": 51539607552,
+      "platform": "macOS-27.0-arm64-arm-64bit",
+      "processor": "arm"
+    },
+    "packages": {
+      "huggingface-hub": "1.27.0",
+      "mlx": "0.32.0",
+      "mlx-lm": "0.31.3",
+      "mlx-vlm": "0.6.3",
+      "omlx": "0.5.8.dev3",
+      "pyarrow": "25.0.1",
+      "transformers": "5.12.1"
+    }
+  },
+  "results": [
+    {
+      "kind": "organic",
+      "metadata": {
+        "chunk_size": 2048,
+        "dataset": {
+          "filename": "2needle/2needle_0.parquet",
+          "repo_id": "openai/mrcr",
+          "revision": "f4c69fae7cf81f7ca26b9fee34b392a50f6b8a1d",
+          "row_index": 35
+        },
+        "exclusive_ownership": true,
+        "forced_trigger": false,
+        "no_cache": true,
+        "prefill_abort_margin": 0.95,
+        "prefill_min_chunk_tokens": 32,
+        "prompt_tokens": 131071,
+        "teacher_forced_replay_tokens": 256,
+        "thinking_enabled": false
+      },
+      "metrics": {
+        "actual_mid_prefill_trigger": true,
+        "conversion_seconds": 2.717579290998401,
+        "conversion_slices": 120,
+        "converted_layers": 15,
+        "dataset_prompt_sha256": "803a44dadf06cd990fb4d94542eaf8b39283ef644528d437f0af5a3147f2b332",
+        "eviction_callback_reclaimed": false,
+        "eviction_pause_count": 0,
+        "eviction_pause_seconds": 0.0,
+        "external_prefill_attempt_seconds": [
+          1702.0284220829926
+        ],
+        "external_prefill_seconds": 1702.0284220829926,
+        "full_rendered_sha256": "91d6f11f65047bcf41499c4371b127d0370acb0841e7ae671d1ffebad7c2d304",
+        "full_rendered_token_count": 138570,
+        "held_final_prompt_token_seconds": 6.0992297079938,
+        "memory": {
+          "mlx_active_baseline_bytes": 19009290256,
+          "mlx_active_final_bytes": 23768777626,
+          "mlx_cache_baseline_bytes": 0,
+          "mlx_cache_final_bytes": 13792574326,
+          "mlx_peak_bytes": 32179150926
+        },
+        "mid_prefill_conversion_attempt_count": 1,
+        "post_trigger_seconds": 1189.2448989999975,
+        "post_trigger_tokens": 67582,
+        "post_trigger_tokens_per_second": 56.82765598307615,
+        "prefill_attempt_count": 1,
+        "prefill_eviction_retries": 0,
+        "prompt_token_count": 131071,
+        "prompt_token_ids_sha256": "3409225a327990bd4763c68987dd0466c5f27612602f11817a391c8375891827",
+        "replay_token_count": 256,
+        "replay_token_ids_sha256": "86b19f0f1ce1a3105b2c994dae1ca95ea7790b94872f33a38ca19ecd3a6fa8a9",
+        "skipped_dense_layers": 1,
+        "teacher_forced": {
+          "decode_seconds": 37.481745794983,
+          "decode_tokens_per_second": 6.829991361668807,
+          "first_token_nll": 2.4017372131347656,
+          "latency_median_seconds": 0.14216420800221385,
+          "latency_p95_seconds": 0.15750191699771676,
+          "mean_nll": 1.7628095373511314,
+          "nll_sum": 451.27924156188965,
+          "perplexity": 5.828790616099849,
+          "token_count": 256,
+          "token_ids_sha256": "86b19f0f1ce1a3105b2c994dae1ca95ea7790b94872f33a38ca19ecd3a6fa8a9",
+          "tokens_2_to_n_count": 255,
+          "tokens_2_to_n_mean_nll": 1.760303938622568,
+          "tokens_2_to_n_perplexity": 5.814204287117874
+        },
+        "total_prefill_seconds": 1708.1285130000033,
+        "total_prefill_tokens_per_second": 76.73368777727309,
+        "trigger_tokens": 63488
+      },
+      "mode": "organic-mid-q8",
+      "schema_version": 1,
+      "status": "ok",
+      "supervision": {
+        "child_limit_bytes": 48318382080,
+        "host_headroom_metric": "host_statistics64.free+inactive",
+        "host_minimum_bytes": 3221225472,
+        "minimum_host_headroom_bytes": 4001349632,
+        "peak_child_phys_footprint_bytes": 38436322232,
+        "poll_interval_seconds": 0.25,
+        "polling_sample_payload_omission": {
+          "detail_payload_in_public_artifact": false,
+          "detail_payload_in_source_artifact": false,
+          "preserved_sample_count": 6954
+        },
+        "samples": 6954
+      }
+    }
+  ],
+  "sanitization": {
+    "fixed_envelope": "The final Q5 campaign used a fixed, disclosed 45 GiB child ceiling and 3 GiB host floor matching this machine’s configured Metal envelope. Limits were not changed during a command, mandatory telemetry remained fail-closed, and the product’s own memory guard remained active.",
+    "generated_response_bodies": {
+      "included": false,
+      "replacement": "existing response and token hashes/counts plus per-result omission metadata"
+    },
+    "local_filesystem_paths": {
+      "included": false,
+      "replacement": "public model and dataset identifiers"
+    },
+    "polling_sample_payloads": {
+      "included": false,
+      "replacement": "aggregate sample counts plus per-result omission metadata"
+    }
+  },
+  "schema_version": 1,
+  "source_tensors": {
+    "after": [
+      {
+        "path": "model-00001-of-00005.safetensors",
+        "sha256": "7cd738dc6c3ef480d5e7a062ed81136ffe74102d309ece71a14ace37721f4528",
+        "size_bytes": 5047702365
+      },
+      {
+        "path": "model-00002-of-00005.safetensors",
+        "sha256": "acb5e76adb0713f1da002ec05b88cc509097411cbd0f1bda1037b84eb4296217",
+        "size_bytes": 5030984870
+      },
+      {
+        "path": "model-00003-of-00005.safetensors",
+        "sha256": "f39baa70564267a59ead58bfa56a27dbb588a5826874ac57c4103b1a4ee3e511",
+        "size_bytes": 5005108113
+      },
+      {
+        "path": "model-00004-of-00005.safetensors",
+        "sha256": "14db05492f288ea054bcb43b4ae9b7f345396e195ee8c51411ceb2276666c1c0",
+        "size_bytes": 5012433624
+      },
+      {
+        "path": "model-00005-of-00005.safetensors",
+        "sha256": "afbbee7b01452e9cd32922b385b3ca220ad1de8bfcb41a88d622eab3eedd131e",
+        "size_bytes": 194686844
+      }
+    ],
+    "before": [
+      {
+        "path": "model-00001-of-00005.safetensors",
+        "sha256": "7cd738dc6c3ef480d5e7a062ed81136ffe74102d309ece71a14ace37721f4528",
+        "size_bytes": 5047702365
+      },
+      {
+        "path": "model-00002-of-00005.safetensors",
+        "sha256": "acb5e76adb0713f1da002ec05b88cc509097411cbd0f1bda1037b84eb4296217",
+        "size_bytes": 5030984870
+      },
+      {
+        "path": "model-00003-of-00005.safetensors",
+        "sha256": "f39baa70564267a59ead58bfa56a27dbb588a5826874ac57c4103b1a4ee3e511",
+        "size_bytes": 5005108113
+      },
+      {
+        "path": "model-00004-of-00005.safetensors",
+        "sha256": "14db05492f288ea054bcb43b4ae9b7f345396e195ee8c51411ceb2276666c1c0",
+        "size_bytes": 5012433624
+      },
+      {
+        "path": "model-00005-of-00005.safetensors",
+        "sha256": "afbbee7b01452e9cd32922b385b3ca220ad1de8bfcb41a88d622eab3eedd131e",
+        "size_bytes": 194686844
+      }
+    ],
+    "unchanged": true
+  },
+  "status": "ok"
+}
