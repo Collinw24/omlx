@@ -87,15 +87,6 @@ class SupervisedOutcome:
     error: str | None
 
 
-@dataclass(slots=True)
-class OrganicPrefillPause:
-    """First organic prefill attempt paused for the production LRU callback."""
-
-    baseline: dict[str, int]
-    context: Any
-    eviction_request: Any
-    external_seconds: float
-    total_started: float
 
 
 def matrix_modes() -> tuple[ValidationMode, ...]:
@@ -1234,13 +1225,14 @@ def _find_pool_model_id(pool: Any, model_path: Path) -> str:
     return matches[0]
 
 
-def _capture_initial_prefill_pause(
+def _capture_no_victim_organic_prefill(
     mx: Any,
     scheduler: Any,
     request: Any,
     prompt_ids: Sequence[int],
-) -> OrganicPrefillPause:
-    """Run the first organic attempt and require the production LRU pause."""
+    replay_ids: Sequence[int],
+) -> dict[str, Any]:
+    """Run one sole-model prefill and require in-attempt conversion."""
     from omlx.scheduler import _PrefillEvictionNeeded
 
     captured: list[Any] = []
@@ -1260,81 +1252,23 @@ def _capture_initial_prefill_pause(
     baseline = _reset_mlx_measurement(mx)
     mx.synchronize()
     total_started = time.perf_counter()
-    attempt_started = time.perf_counter()
+    cache: list[Any] | None = None
+    logits: Any | None = None
     try:
         try:
-            completed = scheduler._do_external_prefill(
-                request,
-                list(prompt_ids),
-                existing_cache=None,
+            (cache, last_token), external_seconds = _timed_synchronized(
+                mx,
+                partial(
+                    scheduler._do_external_prefill,
+                    request,
+                    list(prompt_ids),
+                    existing_cache=None,
+                ),
             )
         except _PrefillEvictionNeeded as exc:
-            mx.synchronize()
-            external_seconds = time.perf_counter() - attempt_started
-            eviction_request = exc.request
-        else:
-            del completed
             raise ValidationError(
-                "organic first prefill attempt completed without the production LRU pause"
-            )
-        if len(captured) != 1:
-            raise ValidationError(
-                f"organic first attempt captured {len(captured)} contexts instead of one"
-            )
-        context = captured[0]
-        if context.mid_triggered:
-            raise ValidationError(
-                "organic first attempt converted before the LRU pause"
-            )
-        return OrganicPrefillPause(
-            baseline=baseline,
-            context=context,
-            eviction_request=eviction_request,
-            external_seconds=external_seconds,
-            total_started=total_started,
-        )
-    finally:
-        scheduler._new_prefill_context = original
-        gc.collect()
-        mx.synchronize()
-        mx.clear_cache()
-
-
-def _capture_external_prefill_after_pause(
-    mx: Any,
-    scheduler: Any,
-    request: Any,
-    prompt_ids: Sequence[int],
-    replay_ids: Sequence[int],
-    pause: OrganicPrefillPause,
-    eviction_callback_result: bool,
-    eviction_pause_seconds: float,
-) -> dict[str, Any]:
-    """Retry organic prefill after LRU handling and require one conversion."""
-    captured: list[Any] = []
-    original = scheduler._new_prefill_context
-
-    def _capture(
-        inner_request: Any,
-        prompt_cache: list[Any],
-        *,
-        loop_label: str,
-    ) -> Any:
-        context = original(inner_request, prompt_cache, loop_label=loop_label)
-        captured.append(context)
-        return context
-
-    scheduler._new_prefill_context = _capture
-    try:
-        (cache, last_token), retry_external_seconds = _timed_synchronized(
-            mx,
-            partial(
-                scheduler._do_external_prefill,
-                request,
-                list(prompt_ids),
-                existing_cache=None,
-            ),
-        )
+                "organic sole-model prefill requested an external-victim pause"
+            ) from exc
         external_completed = time.perf_counter()
         with mx.stream(scheduler._stream):
             logits, final_seconds = _timed_synchronized(
@@ -1347,7 +1281,7 @@ def _capture_external_prefill_after_pause(
                     tuple(last_token),
                 ),
             )
-        total_seconds = time.perf_counter() - pause.total_started
+        total_seconds = time.perf_counter() - total_started
         replay = _teacher_forced_replay(
             mx,
             scheduler.model,
@@ -1358,47 +1292,46 @@ def _capture_external_prefill_after_pause(
         )
         if len(captured) != 1:
             raise ValidationError(
-                f"organic retry captured {len(captured)} contexts instead of one"
+                f"organic prefill captured {len(captured)} contexts instead of one"
             )
         context = captured[0]
-        if context is pause.context:
-            raise ValidationError("organic retry reused the first attempt's context")
-        if pause.context.mid_triggered:
-            raise ValidationError("organic first attempt converted before its pause")
         if not context.mid_triggered:
             raise ValidationError(
-                "organic retry completed without mid-prefill conversion"
+                "organic prefill completed without mid-prefill conversion"
             )
-        if int(request.prefill_eviction_retries) != 1:
+        if not context.conversion_attempted:
             raise ValidationError(
-                "organic request did not retain exactly one production LRU retry"
+                "organic prefill triggered without recording its conversion attempt"
+            )
+        if int(request.prefill_eviction_retries) != 0:
+            raise ValidationError(
+                "organic sole-model prefill restarted for an external victim"
+            )
+        if request.turboquant_mid_prefill_attempted is not True:
+            raise ValidationError(
+                "organic request did not retain its one conversion attempt"
             )
         post_trigger_seconds = (
             external_completed - context.conversion_completed_at
             if context.conversion_completed_at is not None
             else 0.0
         )
-        memory = _finish_mlx_measurement(mx, pause.baseline)
-        cache = None
-        logits = None
-        external_attempt_seconds = [
-            pause.external_seconds,
-            retry_external_seconds,
-        ]
+        memory = _finish_mlx_measurement(mx, baseline)
         return {
             "actual_mid_prefill_trigger": True,
-            "prefill_attempt_count": 2,
-            "eviction_pause_count": 1,
-            "prefill_eviction_retries": int(request.prefill_eviction_retries),
-            "eviction_callback_reclaimed": bool(eviction_callback_result),
-            "eviction_pause_seconds": eviction_pause_seconds,
+            "mid_prefill_conversion_attempt_count": 1,
+            "prefill_attempt_count": 1,
+            "eviction_pause_count": 0,
+            "prefill_eviction_retries": 0,
+            "eviction_callback_reclaimed": False,
+            "eviction_pause_seconds": 0.0,
             "trigger_tokens": context.trigger_tokens,
             "conversion_seconds": float(context.conversion_seconds),
             "converted_layers": int(context.converted_layers),
             "conversion_slices": int(context.conversion_slices),
             "skipped_dense_layers": int(context.skipped_dense_layers),
-            "external_prefill_attempt_seconds": external_attempt_seconds,
-            "external_prefill_seconds": sum(external_attempt_seconds),
+            "external_prefill_attempt_seconds": [external_seconds],
+            "external_prefill_seconds": external_seconds,
             "held_final_prompt_token_seconds": final_seconds,
             "total_prefill_seconds": total_seconds,
             "total_prefill_tokens_per_second": (
@@ -1415,6 +1348,8 @@ def _capture_external_prefill_after_pause(
             "memory": memory,
         }
     finally:
+        cache = None
+        logits = None
         scheduler._new_prefill_context = original
         gc.collect()
         mx.synchronize()
@@ -1534,31 +1469,14 @@ async def _run_organic_child_async(spec: Mapping[str, Any]) -> dict[str, Any]:
         )
         scheduler.requests[request.request_id] = request
         loop = asyncio.get_running_loop()
-        pause = await loop.run_in_executor(
-            core._mlx_executor,
-            _capture_initial_prefill_pause,
-            mx,
-            scheduler,
-            request,
-            prompt_ids,
-        )
-        eviction_started = time.perf_counter()
-        eviction_callback_result = await pool._evict_idle_lru_for_prefill(
-            exclude_model_id=model_id,
-            eviction_request=pause.eviction_request,
-        )
-        eviction_pause_seconds = time.perf_counter() - eviction_started
         metrics = await loop.run_in_executor(
             core._mlx_executor,
-            _capture_external_prefill_after_pause,
+            _capture_no_victim_organic_prefill,
             mx,
             scheduler,
             request,
             prompt_ids,
             replay_ids,
-            pause,
-            eviction_callback_result,
-            eviction_pause_seconds,
         )
         return {
             "schema_version": SCHEMA_VERSION,
